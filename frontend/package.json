@@ -10,9 +10,7 @@
     "lint": "eslint src vite.config.ts"
   },
   "dependencies": {
-    "@cipherdrop/sdk": "0.1.0",
-    "@lucide/svelte": "1.81.0",
-    "highlight.js": "11.12.0"
+    "@cipherdrop/sdk": "0.1.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.2",
@@ -20,6 +18,7 @@
     "@types/node": "26.6.11",
     "eslint": "10.15.0",
     "eslint-plugin-svelte": "3.24.1",
+    "highlight.js": "11.12.0",
     "marked": "18.3.0",
     "svelte": "5.59.2",
     "svelte-check": "4.7.8",
