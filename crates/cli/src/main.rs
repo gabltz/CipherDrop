@@ -74,7 +74,7 @@ enum Cmd {
 #[derive(Args)]
 struct CreateArgs {
     /// Lifetime, e.g. 10m, 1h, 7d (default: server default).
-    #[arg(long, value_parser = humantime::parse_duration)]
+    #[arg(long, value_parser = parse_duration)]
     ttl: Option<Duration>,
     /// One-time share (max reads = 1).
     #[arg(long, conflicts_with_all = ["max_reads", "unlimited_reads"])]
@@ -123,6 +123,25 @@ struct RevokeArgs {
     /// Share id to revoke using the API token (shares:revoke) instead of a revocation link.
     #[arg(long)]
     id: Option<String>,
+}
+
+/// Parse `90`, `90s`, `10m`, `1h`, `7d` (a single number with an optional unit).
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 's')) => (&s[..i], 1),
+        Some((i, 'm')) => (&s[..i], 60),
+        Some((i, 'h')) => (&s[..i], 3600),
+        Some((i, 'd')) => (&s[..i], 86_400),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}; use e.g. 90s, 10m, 1h, 7d"))?;
+    n.checked_mul(mult)
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("invalid duration {s:?}"))
 }
 
 #[derive(Debug)]
@@ -453,4 +472,20 @@ async fn create(g: &Global, a: CreateArgs) -> Result<(), Fail> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90").unwrap().as_secs(), 90);
+        assert_eq!(parse_duration("10m").unwrap().as_secs(), 600);
+        assert_eq!(parse_duration("1h").unwrap().as_secs(), 3600);
+        assert_eq!(parse_duration("7d").unwrap().as_secs(), 604_800);
+        for bad in ["", "0", "h", "1x", "-1h", "1.5h", "99999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
 }

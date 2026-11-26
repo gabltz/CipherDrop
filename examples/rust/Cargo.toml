@@ -6,6 +6,6 @@ publish = false
 license = "MIT"
 
 [dependencies]
-cipherdrop-sdk = { path = "../../crates/sdk" }
+cipherdrop-sdk = { path = "../../crates/sdk", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 secrecy = "0.10"
