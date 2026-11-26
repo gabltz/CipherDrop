@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 21fcd6b5c578ddaf1e9f499aef411446dfd3403be13cf4212b34faac548b1546 # shrinks to ops = [Insert { id: 0, len: 0, ttl: None, reads: None }, Insert { id: 1, len: 0, ttl: None, reads: None }, Insert { id: 2, len: 0, ttl: None, reads: None }, Insert { id: 3, len: 0, ttl: Some(1), reads: None }, Insert { id: 4, len: 0, ttl: None, reads: None }, Insert { id: 12, len: 0, ttl: None, reads: None }, Insert { id: 12, len: 0, ttl: None, reads: None }, Advance { secs: 1 }, Insert { id: 5, len: 0, ttl: None, reads: None }, Insert { id: 6, len: 0, ttl: None, reads: None }, Insert { id: 4, len: 0, ttl: None, reads: None }, Consume { id: 0 }]
