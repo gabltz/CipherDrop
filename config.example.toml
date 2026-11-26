@@ -1,0 +1,71 @@
+# CipherDrop configuration example. Every key is optional except server.public_url.
+# Environment overrides: CIPHERDROP__SECTION__KEY=value (e.g. CIPHERDROP__SERVER__PUBLIC_URL).
+# Validate with: cipherdrop-server check-config --config config.toml
+
+[server]
+listen = "127.0.0.1:8080"
+public_url = "https://paste.example.com"
+max_concurrent_requests = 256
+shutdown_grace_seconds = 10
+# [server.tls]                       # native HTTPS instead of a reverse proxy
+# cert_path = "/etc/cipherdrop/tls/fullchain.pem"
+# key_path  = "/etc/cipherdrop/tls/privkey.pem"
+
+[storage]
+default_backend = "memory"
+max_memory_mb = 128
+max_shares = 10000
+reject_when_full = true
+persistent_enabled = false
+# sqlite_path = "/var/lib/cipherdrop/cipherdrop.sqlite3"
+persistent_max_mb = 1024
+persistent_max_shares = 100000
+cleanup_interval_seconds = 10
+
+[shares]
+max_size_bytes = 1048576
+min_ttl_seconds = 60
+default_ttl_seconds = 3600
+max_ttl_seconds = 604800
+default_max_reads = 1
+max_reads = 100
+allow_permanent = false
+allow_unlimited_reads = false
+
+[auth]
+anonymous_creation = false
+anonymous_retrieval = true
+# Generate with: cipherdrop-server token generate --name ci --scope shares:create
+# [[auth.tokens]]
+# id = "4f1c2a9b7e30"
+# name = "ci"
+# sha256 = "<64 hex chars>"
+# scopes = ["shares:create"]
+
+[security]
+require_https = true
+request_timeout_seconds = 15
+trust_forwarded_headers = false
+trusted_proxies = []
+disable_core_dumps = true
+lock_memory = false
+
+[rate_limit]
+enabled = true
+create_per_minute = 30
+read_per_minute = 120
+token_default_per_minute = 600
+ipv6_prefix_len = 64
+idempotency_ttl_seconds = 600
+idempotency_max_entries = 10000
+
+[cors]
+allowed_origins = []
+
+[logging]
+level = "warn"
+format = "json"
+
+[metrics]
+enabled = false
+require_token = true
