@@ -11,6 +11,7 @@ anonymous_creation = true
 
 [shares]
 min_ttl_seconds = 60
+max_access_failures = 3
 
 [rate_limit]
 create_per_minute = 1000

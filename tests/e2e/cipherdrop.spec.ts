@@ -18,17 +18,15 @@ function instrument(page: Page) {
   return { requests, cspViolations };
 }
 
-async function createInUi(page: Page, secret: string, opts: { password?: string; title?: string; syntax?: string; burn?: boolean } = {}) {
+async function createInUi(page: Page, secret: string, opts: { password?: string; title?: string; burn?: boolean } = {}) {
   await page.goto("/");
   await page.getByTestId("secret-input").fill(secret);
-  if (opts.title || opts.password || opts.syntax) await page.getByTestId("advanced").click();
-  if (opts.title) await page.getByTestId("title").fill(opts.title);
-  if (opts.syntax) await page.locator("#syntax").selectOption(opts.syntax);
-  if (opts.password) {
-    await page.getByTestId("use-password").check({ force: true });
-    await page.getByTestId("password").fill(opts.password);
+  if (opts.title) {
+    await page.locator("details summary").first().click();
+    await page.getByTestId("title").fill(opts.title);
   }
-  if (opts.burn === false) await page.getByTestId("burn").uncheck({ force: true });
+  if (opts.password) await page.getByTestId("password").fill(opts.password);
+  if (opts.burn === false) await page.getByTestId("burn").uncheck();
   await page.getByTestId("create-submit").click();
   await expect(page.getByTestId("share-created")).toBeVisible({ timeout: 20_000 });
   const url = await page.getByTestId("share-url").inputValue();
@@ -106,8 +104,8 @@ test("create in browser, page load does not consume, reveal burns the secret", a
 
 test("untrusted content is rendered as text, never as HTML", async ({ page, browser }) => {
   const payload = `<img src=x onerror="window.__pwned=1"><script>window.__pwned=2</script><b>bold</b>`;
-  for (const syntax of ["", "xml"]) {
-    const { url } = await createInUi(page, payload, { title: "<i>title</i>", syntax });
+  {
+    const { url } = await createInUi(page, payload, { title: "<i>title</i>" });
     const ctx = await browser.newContext();
     const rp = await ctx.newPage();
     const { cspViolations } = instrument(rp);
@@ -122,20 +120,39 @@ test("untrusted content is rendered as text, never as HTML", async ({ page, brow
   }
 });
 
-test("password-protected share: wrong password can be retried without re-consuming", async ({ page, browser }) => {
-  const { url } = await createInUi(page, "pw synthetic secret", { password: "correct horse", burn: true });
+test("password is enforced by the server: wrong attempts consume nothing, then destroy", async ({ page, browser }) => {
+  const { url } = await createInUi(page, "pw synthetic secret", { password: "correct horse" });
+  const id = idOf(url);
   const ctx = await browser.newContext();
   const rp = await ctx.newPage();
+  const { requests } = instrument(rp);
   await rp.goto(url);
   await expect(rp.getByTestId("reveal-password")).toBeVisible();
   await rp.getByTestId("reveal-password").fill("wrong");
   await rp.getByTestId("reveal").click();
   await expect(rp.getByText("Wrong password")).toBeVisible({ timeout: 20_000 });
-  // The share was consumed exactly once; ciphertext is held in memory for the retry.
-  expect((await status(rp, idOf(url))).code).toBe(404);
+  // Server refused: nothing consumed, and the password itself never left the browser.
+  expect((await status(rp, id)).body.remaining_reads).toBe(1);
+  for (const r of requests) expect(r.postData() ?? "").not.toContain("wrong");
+  for (const r of requests) expect(r.postData() ?? "").not.toContain("correct horse");
   await rp.getByTestId("reveal-password").fill("correct horse");
   await rp.getByTestId("reveal").click();
   await expect(rp.getByTestId("revealed-content")).toHaveText("pw synthetic secret", { timeout: 20_000 });
+  expect((await status(rp, id)).code).toBe(404);
+
+  // A second share is destroyed after max_access_failures (3) wrong attempts.
+  const second = await createInUi(page, "brute-force target", { password: "right" });
+  const p2 = await ctx.newPage();
+  await p2.goto(second.url);
+  for (let i = 0; i < 2; i++) {
+    await p2.getByTestId("reveal-password").fill(`guess-${i}`);
+    await p2.getByTestId("reveal").click();
+    await expect(p2.getByText("Wrong password")).toBeVisible({ timeout: 20_000 });
+  }
+  await p2.getByTestId("reveal-password").fill("guess-final");
+  await p2.getByTestId("reveal").click();
+  await expect(p2.getByTestId("state-destroyed")).toBeVisible({ timeout: 20_000 });
+  expect((await status(p2, idOf(second.url))).code).toBe(404);
   await ctx.close();
 });
 
@@ -190,6 +207,7 @@ test("documentation site, search, playground and API explorer", async ({ page })
   for (const slug of ["", "quickstart", "api", "encryption", "sdk", "cli", "security", "deployment", "configuration"]) {
     await page.goto(`/docs${slug ? "/" + slug : ""}`);
     await expect(page.locator("article h1").first()).toBeVisible();
+    await expect(page.locator("main")).not.toContainText("Loading…");
   }
   await page.goto("/docs");
   await page.getByTestId("docs-search").fill("revocation token");
@@ -198,13 +216,14 @@ test("documentation site, search, playground and API explorer", async ({ page })
   // Playground encrypts locally: the shown request body contains ciphertext, not plaintext.
   await page.goto("/docs/api");
   await page.locator("#pg-pt").fill("playground synthetic plaintext");
-  await page.getByRole("button", { name: /Encrypt & create/ }).click();
+  await page.getByRole("button", { name: "Encrypt & create" }).click();
   await expect(page.getByTestId("pg-request")).toContainText("ciphertext");
   await expect(page.getByTestId("pg-request")).not.toContainText("playground synthetic plaintext");
   for (const r of requests) expect(r.postData() ?? "").not.toContain("playground synthetic plaintext");
 
   await page.goto("/docs/api/explorer");
   await expect(page.locator(".swagger-ui .info .title")).toContainText("CipherDrop API", { timeout: 15_000 });
+  expect(page.url()).toContain("/docs/api/explorer");
   await expect(page.locator(".opblock-summary-path").first()).toBeVisible();
   for (const r of requests) expect(new URL(r.url()).origin).toBe(BASE);
   expect(cspViolations).toEqual([]);
