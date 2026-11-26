@@ -1,0 +1,12 @@
+**/node_modules
+**/target
+**/dist
+frontend/dist
+.git
+.github
+**/*.sqlite3*
+tests/e2e/test-results
+tests/e2e/playwright-report
+**/__pycache__
+.env
+*.pem
