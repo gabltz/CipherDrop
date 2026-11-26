@@ -1,0 +1,136 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions: { contents: read }
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend + TypeScript/JavaScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build -w cipherdrop-frontend
+      - uses: actions/upload-artifact@v4
+        with: { name: frontend-dist, path: frontend/dist }
+
+  rust:
+    name: Rust (fmt, clippy, test)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: frontend-dist, path: frontend/dist }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99", components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo bench -p cipherdrop-storage --no-run --locked
+
+  supply-chain:
+    name: cargo audit + cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with: { token: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  interop:
+    name: Cross-language protocol compatibility
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: frontend-dist, path: frontend/dist }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0.x" }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci --ignore-scripts && npm run build -w @cipherdrop/sdk
+      - run: pip install ./sdk/python
+      - run: cargo build --release --locked -p cipherdrop-server -p cipherdrop-cli -p cipherdrop-example
+      - name: Start server
+        run: |
+          ./target/release/cipherdrop-server --config tests/e2e/server.toml &
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:18080/healthz && break; sleep 0.2; done
+      - name: Vectors + live round-trips in every language
+        env:
+          CIPHERDROP_TEST_SERVER: http://127.0.0.1:18080
+          CIPHERDROP_SERVER: http://127.0.0.1:18080
+          CIPHERDROP_ALLOW_INSECURE_HTTP: "1"
+        run: |
+          python -m unittest discover -s sdk/python/tests -v
+          python examples/python/example.py
+          (cd sdk/typescript && node --test test/javascript.test.mjs)
+          node examples/javascript/create-and-read.mjs
+          ./target/release/cipherdrop-example
+          pwsh -NoProfile -File examples/powershell/Test-Vectors.ps1
+          (cd examples/dotnet && dotnet run -c Release -- vectors ../../crates/protocol/testdata/vectors.json)
+          L=$(echo "dotnet synthetic" | (cd examples/dotnet && dotnet run -c Release -- create "$CIPHERDROP_SERVER")) && echo "$L" | (cd examples/dotnet && dotnet run -c Release -- read)
+          CIPHERDROP_BIN=./target/release/cipherdrop bash examples/bash/cipherdrop-demo.sh
+          bash examples/curl/create-and-consume.sh
+
+  e2e:
+    name: Browser end-to-end (Playwright)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: frontend-dist, path: frontend/dist }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci --ignore-scripts
+      - run: cargo build --release --locked -p cipherdrop-server -p cipherdrop-cli
+      - run: npx playwright install --with-deps chromium
+        working-directory: tests/e2e
+      - run: npx playwright test
+        working-directory: tests/e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: playwright-traces, path: tests/e2e/test-results }
+
+  docker:
+    name: Docker image (build + smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with: { context: ., load: true, tags: "cipherdrop:ci", cache-from: type=gha, cache-to: "type=gha,mode=max" }
+      - name: Smoke test hardened container
+        run: |
+          docker run -d --name cd -p 127.0.0.1:8080:8080 --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -e CIPHERDROP__SERVER__PUBLIC_URL=http://127.0.0.1:8080 -e CIPHERDROP__SECURITY__REQUIRE_HTTPS=false \
+            -e CIPHERDROP__AUTH__ANONYMOUS_CREATION=true cipherdrop:ci
+          for i in $(seq 1 50); do curl -sf http://127.0.0.1:8080/healthz && break; sleep 0.2; done
+          curl -sf http://127.0.0.1:8080/api/v1/version
+          L=$(printf 'docker smoke' | docker exec -i cd cipherdrop --allow-insecure-http --server http://127.0.0.1:8080 create --once)
+          test "$(printf '%s' "$L" | docker exec -i cd cipherdrop --allow-insecure-http read)" = "docker smoke"
+      - uses: anchore/sbom-action@v0
+        with: { image: "cipherdrop:ci", format: spdx-json, output-file: sbom.spdx.json }
+      - uses: anchore/scan-action@v6
+        with: { image: "cipherdrop:ci", fail-build: true, severity-cutoff: high }
