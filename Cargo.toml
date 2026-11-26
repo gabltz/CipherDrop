@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/protocol", "crates/storage", "crates/server"]
+members = ["crates/protocol", "crates/storage", "crates/server", "crates/sdk", "crates/cli"]
 exclude = ["fuzz"]
 
 [workspace.package]
