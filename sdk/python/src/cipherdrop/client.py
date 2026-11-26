@@ -11,8 +11,12 @@ from typing import Any
 from .protocol import (
     ApiError,
     CipherDropError,
+    DecryptionError,
+    access_verifier,
     b64e,
     decrypt,
+    decrypt_with_cek,
+    derive_password_keys,
     encode_payload,
     encrypt,
     parse_revocation_link,
@@ -58,6 +62,9 @@ class CipherDrop:
         key = secrets.token_bytes(32)
         env = encrypt(key, encode_payload(content, title, syntax), password)
         body = dict(env)
+        if password is not None:
+            # Server-enforced password gate: only SHA-256(access_key) is uploaded.
+            body["access_verifier"] = access_verifier(derive_password_keys(key, env["kdf"], password)[1])
         if ttl is not None:
             body["ttl_seconds"] = ttl
         if max_reads is not None:
@@ -67,13 +74,31 @@ class CipherDrop:
         return r
 
     def read(self, link: str, password: str | None = None) -> dict[str, Any]:
-        """Consume one retrieval and decrypt locally. Never retried automatically."""
+        """Consume one retrieval and decrypt locally. Never retried automatically.
+
+        For password-protected shares, the password is checked by the server (via
+        the derived access key) before anything is consumed.
+        """
         _, share_id, key = parse_share_link(link)
-        if password is None and self.status(share_id).get("password_protected"):
-            # Fail before consuming: a retrieval must not be burned without the password.
+        st = self.status(share_id)
+        if st.get("password_protected") and password is None:
             raise CipherDropError("this share requires a password")
-        env = self._call("POST", f"/api/v1/shares/{share_id}/consume", {})
-        payload = json.loads(decrypt(key, env, password))
+        if not st.get("password_protected") and password is not None:
+            raise CipherDropError("this share is not password protected")
+        body: dict[str, Any] = {}
+        cek = None
+        if password is not None:
+            cek, access_key = derive_password_keys(key, st["kdf"], password)
+            if st.get("access_protected"):
+                body["access_key"] = b64e(access_key)
+        env = self._call("POST", f"/api/v1/shares/{share_id}/consume", body)
+        if cek is not None:
+            if env.get("kdf") != st["kdf"]:
+                raise DecryptionError("KDF parameters changed between status and consume")
+            raw = decrypt_with_cek(cek, env)
+        else:
+            raw = decrypt(key, env, None)
+        payload = json.loads(raw)
         if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
             raise CipherDropError("malformed payload")
         return payload

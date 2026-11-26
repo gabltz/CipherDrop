@@ -7,10 +7,9 @@
  * ciphertext‖tag = AES-256-GCM(CEK, nonce, payload, AAD)
  */
 
-import { argon2id } from "hash-wasm";
-
 import { b64urlDecodeExact, b64urlEncode, utf8Encode, wipe } from "./encoding.js";
 import {
+  HKDF_INFO_ACCESS,
   HKDF_INFO_PASSWORD,
   KDF_BOUNDS,
   KDF_SALT_LEN,
@@ -96,19 +95,30 @@ export const DEFAULT_KDF_COST: KdfCost = {
   parallelism: KDF_BOUNDS.defaultParallelism,
 };
 
-/** Derive the content-encryption key bytes (exported for test vectors). */
-export async function deriveContentKey(key: ShareKey, kdf: DecodedKdf | undefined, password: string | undefined): Promise<Uint8Array> {
-  if (!kdf && password === undefined) return new Uint8Array(key.raw());
-  if (kdf && password === undefined) throw new ProtocolError("password_required");
-  if (!kdf && password !== undefined) throw new ProtocolError("password_not_expected");
-  if (!kdf || password === undefined) throw new ProtocolError("malformed");
+/** Argon2id from hash-wasm, loaded on first use (keeps it out of the main bundle). */
+async function argon2(): Promise<typeof import("hash-wasm").argon2id> {
+  return (await import("hash-wasm")).argon2id;
+}
+
+export interface PasswordKeys {
+  /** Content-encryption key. */
+  cek: Uint8Array;
+  /** Access key presented to the server on consume (never used for encryption). */
+  accessKey: Uint8Array;
+}
+
+/**
+ * One Argon2id evaluation → PRK = HKDF-Extract(salt, K ‖ PWK);
+ * CEK = Expand(PRK, "cipherdrop/v1/cek/password"), accessKey = Expand(PRK, "cipherdrop/v1/access").
+ */
+export async function derivePasswordKeys(key: ShareKey, kdf: DecodedKdf, password: string): Promise<PasswordKeys> {
   checkKdfBounds(kdf);
   if (password.length === 0) throw new ProtocolError("password_required");
   const pw = utf8Encode(password.normalize("NFC"));
   let pwk: Uint8Array | undefined;
   let ikm: Uint8Array | undefined;
   try {
-    pwk = await argon2id({
+    pwk = await (await argon2())({
       password: pw,
       salt: kdf.salt,
       parallelism: kdf.parallelism,
@@ -121,15 +131,30 @@ export async function deriveContentKey(key: ShareKey, kdf: DecodedKdf | undefine
     ikm.set(key.raw(), 0);
     ikm.set(pwk, KEY_LEN);
     const base = await subtle().importKey("raw", ab(ikm), "HKDF", false, ["deriveBits"]);
-    const bits = await subtle().deriveBits(
-      { name: "HKDF", hash: "SHA-256", salt: ab(kdf.salt), info: ab(utf8Encode(HKDF_INFO_PASSWORD)) },
-      base,
-      KEY_LEN * 8,
-    );
-    return new Uint8Array(bits);
+    const expand = async (info: string) =>
+      new Uint8Array(
+        await subtle().deriveBits({ name: "HKDF", hash: "SHA-256", salt: ab(kdf.salt), info: ab(utf8Encode(info)) }, base, KEY_LEN * 8),
+      );
+    return { cek: await expand(HKDF_INFO_PASSWORD), accessKey: await expand(HKDF_INFO_ACCESS) };
   } finally {
     wipe(pw, pwk, ikm);
   }
+}
+
+/** base64url(SHA-256(accessKey)), uploaded at creation. */
+export async function accessVerifier(accessKey: Uint8Array): Promise<string> {
+  return b64urlEncode(new Uint8Array(await subtle().digest("SHA-256", ab(accessKey))));
+}
+
+/** Derive the content-encryption key bytes (exported for test vectors). */
+export async function deriveContentKey(key: ShareKey, kdf: DecodedKdf | undefined, password: string | undefined): Promise<Uint8Array> {
+  if (!kdf && password === undefined) return new Uint8Array(key.raw());
+  if (kdf && password === undefined) throw new ProtocolError("password_required");
+  if (!kdf && password !== undefined) throw new ProtocolError("password_not_expected");
+  if (!kdf || password === undefined) throw new ProtocolError("malformed");
+  const keys = await derivePasswordKeys(key, kdf, password);
+  wipe(keys.accessKey);
+  return keys.cek;
 }
 
 async function aesKey(cek: Uint8Array, usage: KeyUsage): Promise<CryptoKey> {
@@ -176,6 +201,44 @@ export async function encrypt(
   const kdf: DecodedKdf = { salt: randomBytes(KDF_SALT_LEN), ...cost };
   checkKdfBounds(kdf);
   return encryptDeterministic(key, plaintext, nonce, { password: password.password, kdf });
+}
+
+/** Decrypt with an already-derived content key (no second Argon2id run). */
+export async function decryptWithCek(cek: Uint8Array, env: DecodedEnvelope): Promise<Uint8Array> {
+  try {
+    const k = await aesKey(cek, "decrypt");
+    const pt = await subtle().decrypt(
+      { name: "AES-GCM", iv: ab(env.nonce), additionalData: ab(buildAad(env.kdf)), tagLength: 128 },
+      k,
+      ab(env.ciphertext),
+    );
+    return new Uint8Array(pt);
+  } catch {
+    throw new ProtocolError("decryption", "decryption failed: wrong key, wrong password, or modified ciphertext");
+  }
+}
+
+/**
+ * Encrypt a payload; with a password, also return the access verifier
+ * computed from the same Argon2id evaluation.
+ */
+export async function encryptPayloadWithAccess(
+  key: ShareKey,
+  payload: SecretPayload,
+  options: { password?: string; cost?: KdfCost; padTo?: number } = {},
+): Promise<{ envelope: DecodedEnvelope; accessVerifier?: string }> {
+  if (options.password === undefined) return { envelope: await encryptPayload(key, payload, options) };
+  const kdf: DecodedKdf = { salt: randomBytes(KDF_SALT_LEN), ...(options.cost ?? DEFAULT_KDF_COST) };
+  const keys = await derivePasswordKeys(key, kdf, options.password);
+  const bytes = encodePayload(payload, options.padTo ?? 256);
+  try {
+    const nonce = randomBytes(NONCE_LEN);
+    const k = await aesKey(keys.cek, "encrypt");
+    const ct = await subtle().encrypt({ name: "AES-GCM", iv: ab(nonce), additionalData: ab(buildAad(kdf)), tagLength: 128 }, k, ab(bytes));
+    return { envelope: { nonce, ciphertext: new Uint8Array(ct), kdf }, accessVerifier: await accessVerifier(keys.accessKey) };
+  } finally {
+    wipe(bytes, keys.cek, keys.accessKey);
+  }
 }
 
 /** Decrypt. Throws ProtocolError("decryption") on wrong key/password or tampering. */

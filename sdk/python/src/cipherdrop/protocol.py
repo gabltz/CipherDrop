@@ -25,6 +25,7 @@ VERSION = 1
 ALGORITHM = "AES-256-GCM"
 AAD_PREFIX = "cipherdrop/v1;alg=AES-256-GCM;kdf="
 HKDF_INFO = b"cipherdrop/v1/cek/password"
+HKDF_INFO_ACCESS = b"cipherdrop/v1/access"
 KDF_BOUNDS = {"memory_kib": (19_456, 262_144), "iterations": (2, 10), "parallelism": (1, 4)}
 DEFAULT_KDF = {"memory_kib": 65_536, "iterations": 3, "parallelism": 1}
 _B64URL = re.compile(r"^[A-Za-z0-9_-]*$")
@@ -91,13 +92,8 @@ def _check_kdf(kdf: dict[str, Any]) -> None:
     b64d(kdf["salt"], 16)
 
 
-def derive_cek(key: bytes, kdf: dict[str, Any] | None, password: str | None) -> bytes:
-    if kdf is None and password is None:
-        return key
-    if kdf is not None and password is None:
-        raise CipherDropError("this share requires a password")
-    if kdf is None:
-        raise CipherDropError("this share is not password protected")
+def derive_password_keys(key: bytes, kdf: dict[str, Any], password: str) -> tuple[bytes, bytes]:
+    """One Argon2id evaluation → (cek, access_key) via HKDF-SHA256 with distinct `info` strings."""
     if not password:
         raise CipherDropError("empty password")
     _check_kdf(kdf)
@@ -106,7 +102,41 @@ def derive_cek(key: bytes, kdf: dict[str, Any] | None, password: str | None) -> 
     pwk = Argon2id(
         salt=salt, length=32, iterations=kdf["iterations"], lanes=kdf["parallelism"], memory_cost=kdf["memory_kib"]
     ).derive(pw)
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=HKDF_INFO).derive(key + pwk)
+    # HKDF-Extract once, Expand twice (same PRK) as in the specification.
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives import hmac
+
+    h = hmac.HMAC(salt, hashes.SHA256())
+    h.update(key + pwk)
+    prk = h.finalize()
+    cek = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=HKDF_INFO).derive(prk)
+    access = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=HKDF_INFO_ACCESS).derive(prk)
+    return cek, access
+
+
+def access_verifier(access_key: bytes) -> str:
+    """base64url(SHA-256(access_key)), uploaded at creation."""
+    d = hashes.Hash(hashes.SHA256())
+    d.update(access_key)
+    return b64e(d.finalize())
+
+
+def derive_cek(key: bytes, kdf: dict[str, Any] | None, password: str | None) -> bytes:
+    if kdf is None and password is None:
+        return key
+    if kdf is not None and password is None:
+        raise CipherDropError("this share requires a password")
+    if kdf is None:
+        raise CipherDropError("this share is not password protected")
+    return derive_password_keys(key, kdf, password or "")[0]
+
+
+def decrypt_with_cek(cek: bytes, env: dict[str, Any]) -> bytes:
+    validate_envelope(env)
+    try:
+        return AESGCM(cek).decrypt(b64d(env["nonce"], 12), b64d(env["ciphertext"]), build_aad(env.get("kdf")))
+    except InvalidTag as e:
+        raise DecryptionError("decryption failed: wrong key, wrong password, or modified data") from e
 
 
 def validate_envelope(env: dict[str, Any]) -> None:

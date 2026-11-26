@@ -24,6 +24,10 @@ class Vectors(unittest.TestCase):
                 self.assertEqual(cd.build_aad(kdf).decode(), v["aad"])
                 self.assertEqual(cd.derive_cek(key, kdf, v["password"]).hex(), v["cek_hex"])
                 self.assertEqual(cd.decrypt(key, env, v["password"]).decode(), v["plaintext"])
+                if v["password"]:
+                    _, ak = cd.derive_password_keys(key, kdf, v["password"])
+                    self.assertEqual(ak.hex(), v["access_key_hex"])
+                    self.assertEqual(cd.access_verifier(ak), v["access_verifier"])
                 again = cd.encrypt(
                     key, v["plaintext"].encode(), v["password"],
                     {k: kdf[k] for k in ("memory_kib", "iterations", "parallelism")} if kdf else None,
@@ -68,7 +72,12 @@ class Live(unittest.TestCase):
         # Reading without the password fails *before* consuming (status check).
         with self.assertRaises(cd.CipherDropError):
             c.read(s["url"])
-        self.assertEqual(c.status(s["id"])["remaining_reads"], 2)
+        with self.assertRaises(cd.ApiError) as e:
+            c.read(s["url"], "wrong password")
+        self.assertEqual(e.exception.code, "access_denied")
+        st = c.status(s["id"])
+        self.assertTrue(st["access_protected"])
+        self.assertEqual(st["remaining_reads"], 2)
         self.assertEqual(c.read(s["url"], "synthetic pass")["content"], "pw")
         c.revoke_with_link(s["revocation_url"])
 
