@@ -1,0 +1,11 @@
+[package]
+name = "cipherdrop-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+cipherdrop-sdk = { path = "../../crates/sdk" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+secrecy = "0.10"
