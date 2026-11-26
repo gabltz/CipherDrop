@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cipherdrop"
+version = "0.1.0"
+description = "CipherDrop client: local AES-256-GCM encryption plus the /api/v1 HTTP API"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=44"]
+classifiers = ["Programming Language :: Python :: 3", "Topic :: Security :: Cryptography"]
+
+[project.scripts]
+cipherdrop-py = "cipherdrop.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cipherdrop = ["py.typed"]
