@@ -1,0 +1,29 @@
+# Fuzz targets for untrusted-input parsers. Requires nightly + cargo-fuzz:
+#   cargo +nightly fuzz run envelope
+[package]
+name = "cipherdrop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cipherdrop-protocol = { path = "../crates/protocol" }
+serde_json = "1"
+
+[workspace]
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "links"
+path = "fuzz_targets/links.rs"
+test = false
+doc = false
