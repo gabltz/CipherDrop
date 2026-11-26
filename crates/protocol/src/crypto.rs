@@ -38,6 +38,8 @@ use crate::{KDF_SALT_LEN, KEY_LEN, NONCE_LEN, ProtocolError};
 
 /// HKDF `info` string for password-protected content keys.
 pub const HKDF_INFO_PASSWORD: &[u8] = b"cipherdrop/v1/cek/password";
+/// HKDF `info` string for the access key of password-protected shares.
+pub const HKDF_INFO_ACCESS: &[u8] = b"cipherdrop/v1/access";
 
 /// Default padding granularity for plaintext payloads (bytes).
 pub const DEFAULT_PAD_TO: usize = 256;
@@ -125,6 +127,71 @@ fn normalize_password(password: &str) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(s.as_bytes().to_vec())
 }
 
+/// Keys derived from the share key and a password (one Argon2id evaluation).
+pub struct PasswordKeys {
+    /// Content-encryption key.
+    pub cek: Zeroizing<[u8; KEY_LEN]>,
+    /// Access key presented to the server on consume (never used for encryption).
+    pub access_key: Zeroizing<[u8; KEY_LEN]>,
+}
+
+impl core::fmt::Debug for PasswordKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PasswordKeys(<redacted>)")
+    }
+}
+
+/// Derive the content key and the access key from `K` and a password.
+///
+/// ```text
+/// PRK        = HKDF-Extract(salt, K ‖ Argon2id(NFC(pw), salt, m, t, p))
+/// CEK        = HKDF-Expand(PRK, "cipherdrop/v1/cek/password", 32)
+/// access_key = HKDF-Expand(PRK, "cipherdrop/v1/access", 32)
+/// ```
+///
+/// The two outputs are independent: knowing `access_key` (which the server
+/// sees on consume) reveals nothing about `CEK`, and neither can be computed
+/// without the 256-bit share key `K`.
+///
+/// # Errors
+/// Fails for empty passwords or out-of-bounds KDF parameters.
+pub fn derive_password_keys(
+    key: &ShareKey,
+    k: &DecodedKdf,
+    password: &str,
+) -> Result<PasswordKeys, ProtocolError> {
+    k.check_bounds()?;
+    if password.is_empty() {
+        return Err(ProtocolError::PasswordRequired);
+    }
+    let pw = normalize_password(password);
+    let params = Params::new(k.memory_kib, k.iterations, k.parallelism, Some(KEY_LEN))
+        .map_err(|_| ProtocolError::Kdf)?;
+    let argon = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
+    let mut pwk = Zeroizing::new([0u8; KEY_LEN]);
+    argon
+        .hash_password_into(&pw, &k.salt, pwk.as_mut())
+        .map_err(|_| ProtocolError::Kdf)?;
+    let mut ikm = Zeroizing::new([0u8; 2 * KEY_LEN]);
+    ikm[..KEY_LEN].copy_from_slice(key.as_bytes());
+    ikm[KEY_LEN..].copy_from_slice(pwk.as_ref());
+    let hk = Hkdf::<Sha256>::new(Some(&k.salt), ikm.as_ref());
+    let mut cek = Zeroizing::new([0u8; KEY_LEN]);
+    hk.expand(HKDF_INFO_PASSWORD, cek.as_mut())
+        .map_err(|_| ProtocolError::Kdf)?;
+    let mut access_key = Zeroizing::new([0u8; KEY_LEN]);
+    hk.expand(HKDF_INFO_ACCESS, access_key.as_mut())
+        .map_err(|_| ProtocolError::Kdf)?;
+    Ok(PasswordKeys { cek, access_key })
+}
+
+/// Server-side verifier for an access key: `SHA-256(access_key)`.
+#[must_use]
+pub fn access_verifier(access_key: &[u8; KEY_LEN]) -> [u8; 32] {
+    use sha2::Digest as _;
+    Sha256::digest(access_key).into()
+}
+
 /// Derive the content-encryption key (exposed for test vectors and SDK debugging).
 ///
 /// # Errors
@@ -140,29 +207,88 @@ pub fn derive_content_key(
         (None, None) => Ok(Zeroizing::new(*key.as_bytes())),
         (Some(_), None) => Err(ProtocolError::PasswordRequired),
         (None, Some(_)) => Err(ProtocolError::PasswordNotExpected),
-        (Some(k), Some(pw)) => {
-            k.check_bounds()?;
-            if pw.is_empty() {
-                return Err(ProtocolError::PasswordRequired);
-            }
-            let pw = normalize_password(pw);
-            let params = Params::new(k.memory_kib, k.iterations, k.parallelism, Some(KEY_LEN))
-                .map_err(|_| ProtocolError::Kdf)?;
-            let argon = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
-            let mut pwk = Zeroizing::new([0u8; KEY_LEN]);
-            argon
-                .hash_password_into(&pw, &k.salt, pwk.as_mut())
-                .map_err(|_| ProtocolError::Kdf)?;
-            let mut ikm = Zeroizing::new([0u8; 2 * KEY_LEN]);
-            ikm[..KEY_LEN].copy_from_slice(key.as_bytes());
-            ikm[KEY_LEN..].copy_from_slice(pwk.as_ref());
-            let hk = Hkdf::<Sha256>::new(Some(&k.salt), ikm.as_ref());
-            let mut cek = Zeroizing::new([0u8; KEY_LEN]);
-            hk.expand(HKDF_INFO_PASSWORD, cek.as_mut())
-                .map_err(|_| ProtocolError::Kdf)?;
-            Ok(cek)
-        }
+        (Some(k), Some(pw)) => Ok(derive_password_keys(key, k, pw)?.cek),
     }
+}
+
+/// Decrypt with an already-derived content key (avoids a second Argon2id run).
+///
+/// # Errors
+/// [`ProtocolError::Decryption`] on authentication failure.
+pub fn decrypt_with_cek(
+    cek: &[u8; KEY_LEN],
+    env: &DecodedEnvelope,
+) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+    let aad = build_aad(env.kdf.as_ref());
+    let cipher = Aes256Gcm::new_from_slice(cek).map_err(|_| ProtocolError::Kdf)?;
+    cipher
+        .decrypt(
+            (&env.nonce).into(),
+            Payload {
+                msg: &env.ciphertext,
+                aad: &aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| ProtocolError::Decryption)
+}
+
+/// Result of [`encrypt_payload_with_access`].
+#[derive(Debug)]
+pub struct EncryptedShare {
+    pub envelope: DecodedEnvelope,
+    /// `SHA-256(access_key)` for password-protected shares (sent to the server at creation).
+    pub access_verifier: Option<[u8; 32]>,
+}
+
+/// Encrypt a payload and, when a password is given, compute the access
+/// verifier from the same Argon2id evaluation.
+///
+/// # Errors
+/// See [`encrypt`].
+pub fn encrypt_payload_with_access(
+    key: &ShareKey,
+    payload: &SecretPayload,
+    password: Option<(&str, KdfCost)>,
+    pad_to: usize,
+) -> Result<EncryptedShare, ProtocolError> {
+    let bytes = Zeroizing::new(payload.to_bytes(pad_to)?);
+    let mut nonce = [0u8; NONCE_LEN];
+    random_bytes(&mut nonce)?;
+    let Some((pw, cost)) = password else {
+        return Ok(EncryptedShare {
+            envelope: encrypt_deterministic(key, &bytes, nonce, None)?,
+            access_verifier: None,
+        });
+    };
+    let mut salt = [0u8; KDF_SALT_LEN];
+    random_bytes(&mut salt)?;
+    let kdf = DecodedKdf {
+        salt,
+        memory_kib: cost.memory_kib,
+        iterations: cost.iterations,
+        parallelism: cost.parallelism,
+    };
+    let keys = derive_password_keys(key, &kdf, pw)?;
+    let aad = build_aad(Some(&kdf));
+    let cipher = Aes256Gcm::new_from_slice(keys.cek.as_ref()).map_err(|_| ProtocolError::Kdf)?;
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &bytes,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| ProtocolError::TooLarge)?;
+    Ok(EncryptedShare {
+        envelope: DecodedEnvelope {
+            nonce,
+            ciphertext,
+            kdf: Some(kdf),
+        },
+        access_verifier: Some(access_verifier(&keys.access_key)),
+    })
 }
 
 /// Low-level deterministic encryption with caller-supplied nonce and KDF salt.
@@ -402,6 +528,54 @@ mod tests {
         for _ in 0..1000 {
             assert!(seen.insert(encrypt(&k, b"", None).unwrap().nonce));
         }
+    }
+
+    #[test]
+    fn access_key_independent_of_cek_and_requires_key() {
+        let k = ShareKey::generate().unwrap();
+        let kdf = DecodedKdf {
+            salt: [9; 16],
+            memory_kib: 19_456,
+            iterations: 2,
+            parallelism: 1,
+        };
+        let a = derive_password_keys(&k, &kdf, "pw").unwrap();
+        assert_ne!(*a.cek, *a.access_key);
+        let b = derive_password_keys(&ShareKey::generate().unwrap(), &kdf, "pw").unwrap();
+        assert_ne!(
+            *a.access_key, *b.access_key,
+            "access key depends on the share key"
+        );
+        let c = derive_password_keys(&k, &kdf, "pw2").unwrap();
+        assert_ne!(*a.access_key, *c.access_key);
+    }
+
+    #[test]
+    fn encrypt_with_access_roundtrip() {
+        let k = ShareKey::generate().unwrap();
+        let s = encrypt_payload_with_access(
+            &k,
+            &SecretPayload::text("x"),
+            Some(("pw", cheap_cost())),
+            0,
+        )
+        .unwrap();
+        let kdf = s.envelope.kdf.unwrap();
+        let keys = derive_password_keys(&k, &kdf, "pw").unwrap();
+        assert_eq!(
+            s.access_verifier.unwrap(),
+            access_verifier(&keys.access_key)
+        );
+        assert_eq!(
+            decrypt_with_cek(&keys.cek, &s.envelope).unwrap().as_slice(),
+            br#"{"content":"x"}"#
+        );
+        assert!(
+            encrypt_payload_with_access(&k, &SecretPayload::text("x"), None, 0)
+                .unwrap()
+                .access_verifier
+                .is_none()
+        );
     }
 
     #[test]

@@ -72,6 +72,26 @@ pub struct CreateShareRequest {
     /// Storage backend; defaults to `memory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageBackend>,
+    /// Password-protected shares only: `SHA-256(access_key)`, unpadded base64url
+    /// (43 characters). When present, the server releases the ciphertext only to
+    /// a consume request presenting the matching `access_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(example = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU")
+    )]
+    pub access_verifier: Option<String>,
+}
+
+/// Request body of `POST /api/v1/shares/{id}/consume`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ConsumeShareRequest {
+    /// Required for shares created with an `access_verifier`: the 32-byte
+    /// access key derived from the share key and the password, base64url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
 }
 
 impl CreateShareRequest {
@@ -87,6 +107,7 @@ impl CreateShareRequest {
             ttl_seconds: None,
             max_reads: None,
             storage: None,
+            access_verifier: None,
         }
     }
 
@@ -174,6 +195,13 @@ pub struct ShareStatusResponse {
     pub remaining_reads: Option<u32>,
     /// Whether the recipient will need a password in addition to the link.
     pub password_protected: bool,
+    /// Whether the server enforces the password before releasing ciphertext
+    /// (consume requires `access_key`).
+    pub access_protected: bool,
+    /// Public Argon2id parameters (password-protected shares only), needed to
+    /// derive the access key before consuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf: Option<KdfParams>,
     pub storage: StorageBackend,
 }
 
@@ -226,6 +254,8 @@ pub struct ConfigResponse {
     pub persistent_enabled: bool,
     pub anonymous_creation: bool,
     pub anonymous_retrieval: bool,
+    /// Wrong access-key attempts after which a password-protected share is destroyed.
+    pub max_access_failures: u32,
     pub kdf: KdfLimits,
 }
 

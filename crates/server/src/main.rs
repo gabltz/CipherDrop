@@ -10,7 +10,7 @@ use cipherdrop_server::app::build_router;
 use cipherdrop_server::auth::generate_token;
 use cipherdrop_server::config::{Config, LogFormat};
 use cipherdrop_server::state::AppState;
-use cipherdrop_server::{hardening, maintenance_loop};
+use cipherdrop_server::{hardening, maintenance_loop, serve};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -197,7 +197,33 @@ async fn serve(cfg: Config) -> ExitCode {
     }
     let listen = cfg.server.listen;
     let grace = Duration::from_secs(cfg.server.shutdown_grace_seconds);
-    let tls = cfg.server.tls.clone();
+    let limits = serve::ConnLimits {
+        max_connections: cfg.server.max_connections,
+        max_connections_per_ip: cfg.server.max_connections_per_ip,
+        header_read_timeout: Duration::from_secs(cfg.server.header_read_timeout_seconds),
+        tls_handshake_timeout: Duration::from_secs(10),
+        trusted_proxies: if cfg.security.trust_forwarded_headers {
+            cfg.security.trusted_proxies.clone()
+        } else {
+            Vec::new()
+        },
+    };
+    let tls = match &cfg.server.tls {
+        None => None,
+        #[cfg(feature = "tls")]
+        Some(t) => match serve::load_tls(&t.cert_path, &t.key_path) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::error!("{e}");
+                return ExitCode::from(1);
+            }
+        },
+        #[cfg(not(feature = "tls"))]
+        Some(_) => {
+            tracing::error!("TLS support is not compiled into this binary");
+            return ExitCode::from(1);
+        }
+    };
     let state = match AppState::new(cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -206,65 +232,19 @@ async fn serve(cfg: Config) -> ExitCode {
         }
     };
     tokio::spawn(maintenance_loop(state.clone()));
-    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
-
-    tracing::warn!(%listen, tls = tls.is_some(), version = env!("CARGO_PKG_VERSION"), "CipherDrop listening");
-
-    let result = match tls {
-        #[cfg(feature = "tls")]
-        Some(t) => {
-            let rustls = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &t.cert_path,
-                &t.key_path,
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("cannot load TLS certificate/key: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            let handle = axum_server::Handle::new();
-            let h2 = handle.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                h2.graceful_shutdown(Some(grace));
-            });
-            axum_server::bind_rustls(listen, rustls)
-                .handle(handle)
-                .serve(app)
-                .await
-        }
-        #[cfg(not(feature = "tls"))]
-        Some(_) => {
-            tracing::error!("TLS support is not compiled into this binary");
+    let app = build_router(state);
+    let listener = match tokio::net::TcpListener::bind(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("cannot bind {listen}: {e}");
             return ExitCode::from(1);
         }
-        None => {
-            let listener = match tokio::net::TcpListener::bind(listen).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("cannot bind {listen}: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-        }
     };
-    match result {
-        Ok(()) => {
-            // Ephemeral shares are intentionally dropped here; nothing is persisted.
-            tracing::warn!("CipherDrop stopped; in-memory shares discarded");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            tracing::error!("server error: {e}");
-            ExitCode::from(1)
-        }
-    }
+    tracing::warn!(%listen, tls = tls.is_some(), version = env!("CARGO_PKG_VERSION"), "CipherDrop listening");
+    serve::run(listener, app, limits, tls, shutdown_signal(), grace).await;
+    // Ephemeral shares are intentionally dropped here; nothing is persisted.
+    tracing::warn!("CipherDrop stopped; in-memory shares discarded");
+    ExitCode::SUCCESS
 }
 
 async fn shutdown_signal() {

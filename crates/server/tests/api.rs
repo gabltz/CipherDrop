@@ -52,7 +52,7 @@ async fn full_lifecycle_roundtrip_one_time() {
 }
 
 #[tokio::test]
-async fn password_protected_roundtrip_and_status_flag() {
+async fn password_share_without_access_verifier_is_rejected() {
     let (app, _) = app("");
     let key = ShareKey::generate().unwrap();
     let cost = KdfCost {
@@ -62,28 +62,17 @@ async fn password_protected_roundtrip_and_status_flag() {
     };
     let env = encrypt_payload(
         &key,
-        &SecretPayload::text("pw-protected synthetic"),
-        Some(("pass phrase", cost)),
+        &SecretPayload::text("ungated"),
+        Some(("pw", cost)),
         256,
     )
     .unwrap();
-    let created = create(&app, &CreateShareRequest::from_envelope(env.to_wire())).await;
-    let st = send(
+    let r = send(
         &app,
-        Req::get(format!("/api/v1/shares/{}/status", created.id)),
+        Req::post("/api/v1/shares").json(&CreateShareRequest::from_envelope(env.to_wire())),
     )
     .await;
-    assert_eq!(st.json()["password_protected"], true);
-    let c: ConsumeShareResponse =
-        serde_json::from_slice(&consume(&app, &created.id).await.body).unwrap();
-    let env = c.envelope().decode(usize::MAX).unwrap();
-    assert!(decrypt_payload(&key, &env, Some("wrong")).is_err());
-    assert_eq!(
-        decrypt_payload(&key, &env, Some("pass phrase"))
-            .unwrap()
-            .content,
-        "pw-protected synthetic"
-    );
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -816,4 +805,146 @@ async fn metrics_protection_and_bounded_labels() {
     assert!(t.contains("cipherdrop_shares_created_total{storage=\"memory\"} 1"));
     assert!(t.contains("cipherdrop_shares_consumed_total{storage=\"memory\"} 1"));
     assert!(!t.contains(&created.id));
+}
+
+fn gated_request(content: &str, password: &str) -> (CreateShareRequest, ShareKey) {
+    use cipherdrop_protocol::crypto::encrypt_payload_with_access;
+    let key = ShareKey::generate().unwrap();
+    let cost = KdfCost {
+        memory_kib: kdf_bounds::MIN_MEMORY_KIB,
+        iterations: kdf_bounds::MIN_ITERATIONS,
+        parallelism: 1,
+    };
+    let s = encrypt_payload_with_access(
+        &key,
+        &SecretPayload::text(content),
+        Some((password, cost)),
+        256,
+    )
+    .unwrap();
+    let mut req = CreateShareRequest::from_envelope(s.envelope.to_wire());
+    req.access_verifier = Some(cipherdrop_protocol::encoding::b64_encode(
+        &s.access_verifier.unwrap(),
+    ));
+    (req, key)
+}
+
+fn access_key_for(key: &ShareKey, status: &serde_json::Value, password: &str) -> String {
+    let kdf: cipherdrop_protocol::KdfParams =
+        serde_json::from_value(status["kdf"].clone()).unwrap();
+    let keys =
+        cipherdrop_protocol::crypto::derive_password_keys(key, &kdf.decode().unwrap(), password)
+            .unwrap();
+    cipherdrop_protocol::encoding::b64_encode(keys.access_key.as_ref())
+}
+
+#[tokio::test]
+async fn access_password_is_enforced_by_the_server() {
+    let (app, _) = app("[shares]\nmax_access_failures = 3\n");
+    let (mut req, key) = gated_request("gated synthetic", "open sesame");
+    req.max_reads = Some(Some(2));
+    let created = create(&app, &req).await;
+    let status = send(
+        &app,
+        Req::get(format!("/api/v1/shares/{}/status", created.id)),
+    )
+    .await
+    .json();
+    assert_eq!(status["password_protected"], true);
+    assert_eq!(status["access_protected"], true);
+    assert_eq!(status["kdf"]["algorithm"], "argon2id");
+    let uri = format!("/api/v1/shares/{}/consume", created.id);
+
+    // Without access key, and with a wrong one: denied, nothing consumed.
+    let r = send(&app, Req::post(&uri).raw_json("{}")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.code(), "access_denied");
+    assert!(!r.text().contains("ciphertext"));
+    let wrong = access_key_for(&key, &status, "wrong");
+    let r = send(
+        &app,
+        Req::post(&uri).json(&serde_json::json!({ "access_key": wrong })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let s = send(
+        &app,
+        Req::get(format!("/api/v1/shares/{}/status", created.id)),
+    )
+    .await
+    .json();
+    assert_eq!(s["remaining_reads"], 2, "denied attempts must not consume");
+    let r = send(
+        &app,
+        Req::post(&uri).json(&serde_json::json!({ "access_key": "short" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    // Correct password: released and decryptable.
+    let good = access_key_for(&key, &status, "open sesame");
+    let r = send(
+        &app,
+        Req::post(&uri).json(&serde_json::json!({ "access_key": good })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let c: ConsumeShareResponse = serde_json::from_slice(&r.body).unwrap();
+    let env = c.envelope().decode(usize::MAX).unwrap();
+    assert_eq!(
+        decrypt_payload(&key, &env, Some("open sesame"))
+            .unwrap()
+            .content,
+        "gated synthetic"
+    );
+
+    // Third failure (failure budget = 3) destroys the share.
+    let r = send(
+        &app,
+        Req::post(&uri).json(&serde_json::json!({ "access_key": wrong })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::GONE);
+    assert_eq!(r.code(), "share_destroyed");
+    assert_eq!(
+        send(
+            &app,
+            Req::post(&uri).json(&serde_json::json!({ "access_key": good }))
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn access_verifier_requires_kdf() {
+    let (app, _) = app("");
+    let (mut req, _) = encrypted_request("no kdf");
+    req.access_verifier = Some("A".repeat(43));
+    let r = send(&app, Req::post("/api/v1/shares").json(&req)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let (mut req, _) = gated_request("x", "pw");
+    req.access_verifier = Some("bad".into());
+    assert_eq!(
+        send(&app, Req::post("/api/v1/shares").json(&req))
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn explorer_has_minimal_csp() {
+    let (app, _) = app("");
+    let r = send(&app, Req::get("/docs/api/explorer")).await;
+    let csp = r.headers["content-security-policy"].to_str().unwrap();
+    assert!(!csp.contains("wasm-unsafe-eval"));
+    let r = send(&app, Req::get("/")).await;
+    assert!(
+        r.headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("wasm-unsafe-eval")
+    );
 }

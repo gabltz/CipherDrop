@@ -22,9 +22,11 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::{Consumed, NewShare, RevokeAuth, Status, StoreError, StoredEnvelope, Verifier};
+use crate::{
+    AccessCheck, Consumed, NewShare, RevokeAuth, Status, StoreError, StoredEnvelope, Verifier,
+};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -43,7 +45,9 @@ CREATE TABLE IF NOT EXISTS shares (
     created_at          INTEGER NOT NULL,
     expires_at          INTEGER,
     remaining_reads     INTEGER CHECK (remaining_reads IS NULL OR remaining_reads > 0),
-    revocation_verifier BLOB NOT NULL
+    revocation_verifier BLOB NOT NULL,
+    access_verifier     BLOB,
+    access_failures     INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS shares_expires_at ON shares (expires_at) WHERE expires_at IS NOT NULL;
@@ -174,6 +178,17 @@ impl PersistentStore {
                 .map_err(be)?;
             }
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
+            Some(v) if v == "1" => {
+                // v1 → v2: server-enforced access gate.
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE shares ADD COLUMN access_verifier BLOB;
+                     ALTER TABLE shares ADD COLUMN access_failures INTEGER NOT NULL DEFAULT 0;
+                     UPDATE meta SET value = '2' WHERE key = 'schema_version';
+                     COMMIT;",
+                )
+                .map_err(be)?;
+            }
             Some(_) => return Err(StoreError::Backend),
         }
         Ok(Self {
@@ -210,8 +225,9 @@ impl PersistentStore {
         let k = share.envelope.kdf.as_ref();
         let res = tx.execute(
             "INSERT INTO shares (id_hash, nonce, ciphertext, kdf_salt, kdf_memory_kib, kdf_iterations,
-                                 kdf_parallelism, created_at, expires_at, remaining_reads, revocation_verifier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                 kdf_parallelism, created_at, expires_at, remaining_reads, revocation_verifier,
+                                 access_verifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &id_hash(id)[..],
                 &share.envelope.nonce[..],
@@ -224,6 +240,7 @@ impl PersistentStore {
                 share.meta.expires_at.map(to_i64),
                 share.meta.remaining_reads,
                 &share.revocation.0[..],
+                share.access.map(|v| v.0.to_vec()),
             ],
         );
         match res {
@@ -242,7 +259,12 @@ impl PersistentStore {
     ///
     /// # Errors
     /// [`StoreError::Unavailable`] or [`StoreError::Backend`].
-    pub fn consume(&self, id: &ShareId, now: u64) -> Result<Consumed, StoreError> {
+    pub fn consume(
+        &self,
+        id: &ShareId,
+        now: u64,
+        access: AccessCheck<'_>,
+    ) -> Result<Consumed, StoreError> {
         let h = id_hash(id);
         let mut conn = self.conn.lock();
         let tx = conn
@@ -251,7 +273,7 @@ impl PersistentStore {
         let row = tx
             .query_row(
                 "SELECT nonce, ciphertext, kdf_salt, kdf_memory_kib, kdf_iterations, kdf_parallelism,
-                        expires_at, remaining_reads
+                        expires_at, remaining_reads, access_verifier, access_failures
                  FROM shares WHERE id_hash = ?1",
                 params![&h[..]],
                 |r| {
@@ -264,12 +286,15 @@ impl PersistentStore {
                         r.get::<_, Option<u32>>(5)?,
                         r.get::<_, Option<i64>>(6)?,
                         r.get::<_, Option<u32>>(7)?,
+                        r.get::<_, Option<Vec<u8>>>(8)?,
+                        r.get::<_, u32>(9)?,
                     ))
                 },
             )
             .optional()
             .map_err(be)?;
-        let Some((nonce, ciphertext, salt, m, t, p, expires_at, remaining)) = row else {
+        let Some((nonce, ciphertext, salt, m, t, p, expires_at, remaining, gate, failures)) = row
+        else {
             return Err(StoreError::Unavailable);
         };
         let expires_at = expires_at.map(to_u64);
@@ -278,6 +303,25 @@ impl PersistentStore {
                 .map_err(be)?;
             tx.commit().map_err(be)?;
             return Err(StoreError::Unavailable);
+        }
+        if let Some(g) = gate {
+            let v = Verifier(g.try_into().map_err(|_| StoreError::Backend)?);
+            if !access.key.is_some_and(|k| v.verify(k)) {
+                let failures = failures.saturating_add(1);
+                let destroyed = access.max_failures > 0 && failures >= access.max_failures;
+                if destroyed {
+                    tx.execute("DELETE FROM shares WHERE id_hash = ?1", params![&h[..]])
+                        .map_err(be)?;
+                } else {
+                    tx.execute(
+                        "UPDATE shares SET access_failures = ?2 WHERE id_hash = ?1",
+                        params![&h[..], failures],
+                    )
+                    .map_err(be)?;
+                }
+                tx.commit().map_err(be)?;
+                return Err(StoreError::AccessDenied { destroyed });
+            }
         }
         let remaining_after = match remaining {
             None => None,
@@ -314,29 +358,38 @@ impl PersistentStore {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
-                "SELECT expires_at, remaining_reads, kdf_salt IS NOT NULL FROM shares WHERE id_hash = ?1",
+                "SELECT expires_at, remaining_reads, kdf_salt, kdf_memory_kib, kdf_iterations,
+                        kdf_parallelism, access_verifier IS NOT NULL
+                 FROM shares WHERE id_hash = ?1",
                 params![&h[..]],
                 |r| {
                     Ok((
                         r.get::<_, Option<i64>>(0)?,
                         r.get::<_, Option<u32>>(1)?,
-                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                        r.get::<_, Option<u32>>(3)?,
+                        r.get::<_, Option<u32>>(4)?,
+                        r.get::<_, Option<u32>>(5)?,
+                        r.get::<_, bool>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(be)?;
-        Ok(row.and_then(|(e, r, pw)| {
-            let e = e.map(to_u64);
-            if e.is_some_and(|x| x <= now) {
-                None
-            } else {
-                Some(Status {
-                    expires_at: e,
-                    remaining_reads: r,
-                    password_protected: pw,
-                })
-            }
+        let Some((e, r, salt, m, t, p, gated)) = row else {
+            return Ok(None);
+        };
+        let e = e.map(to_u64);
+        if e.is_some_and(|x| x <= now) {
+            return Ok(None);
+        }
+        let kdf = decode_row(vec![0; NONCE_LEN], Vec::new(), salt, m, t, p)?.kdf;
+        Ok(Some(Status {
+            expires_at: e,
+            remaining_reads: r,
+            password_protected: kdf.is_some(),
+            access_protected: gated,
+            kdf,
         }))
     }
 
@@ -561,6 +614,7 @@ mod tests {
                 remaining_reads: reads,
             },
             revocation: Verifier::from_secret(b"rv"),
+            access: None,
         }
     }
 
@@ -589,13 +643,29 @@ mod tests {
         let s = PersistentStore::open(&path, limits()).unwrap();
         let st = s.status(&id(1), 0).unwrap().unwrap();
         assert!(st.password_protected);
-        let c = s.consume(&id(1), 0).unwrap();
+        let c = s.consume(&id(1), 0, AccessCheck::none()).unwrap();
         assert_eq!(c.remaining_reads, Some(1));
         assert_eq!(c.envelope.kdf.unwrap().memory_kib, 65536);
-        assert_eq!(s.consume(&id(1), 0).unwrap().remaining_reads, Some(0));
-        assert_eq!(s.consume(&id(1), 0).unwrap_err(), StoreError::Unavailable);
-        assert_eq!(s.consume(&id(2), 5).unwrap().remaining_reads, None);
-        assert!(s.consume(&id(2), 100).is_err(), "expired");
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none())
+                .unwrap()
+                .remaining_reads,
+            Some(0)
+        );
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none()).unwrap_err(),
+            StoreError::Unavailable
+        );
+        assert_eq!(
+            s.consume(&id(2), 5, AccessCheck::none())
+                .unwrap()
+                .remaining_reads,
+            None
+        );
+        assert!(
+            s.consume(&id(2), 100, AccessCheck::none()).is_err(),
+            "expired"
+        );
         assert_eq!(s.usage().unwrap(), (0, 0));
     }
 
@@ -609,6 +679,52 @@ mod tests {
         drop(s);
         let bytes = std::fs::read(&path).unwrap();
         assert!(!bytes.windows(16).any(|w| w == b"RAW-ID-MARKER-01"));
+    }
+
+    #[test]
+    fn access_gate_persists_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.sqlite3");
+        let wrong = AccessCheck {
+            key: Some(b"bad"),
+            max_failures: 2,
+        };
+        {
+            let s = PersistentStore::open(&path, limits()).unwrap();
+            let mut sh = share(Some(1), None, true);
+            sh.access = Some(Verifier::from_secret(b"good"));
+            s.insert(&id(5), &sh, 0).unwrap();
+            assert!(s.status(&id(5), 0).unwrap().unwrap().access_protected);
+            assert_eq!(
+                s.consume(&id(5), 0, wrong).unwrap_err(),
+                StoreError::AccessDenied { destroyed: false }
+            );
+        }
+        let s = PersistentStore::open(&path, limits()).unwrap();
+        assert_eq!(
+            s.consume(&id(5), 0, wrong).unwrap_err(),
+            StoreError::AccessDenied { destroyed: true }
+        );
+        assert!(s.status(&id(5), 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrates_v1_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.sqlite3");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+                INSERT INTO meta VALUES ('schema_version', '1');
+                CREATE TABLE shares (id_hash BLOB PRIMARY KEY, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                  kdf_salt BLOB, kdf_memory_kib INTEGER, kdf_iterations INTEGER, kdf_parallelism INTEGER,
+                  created_at INTEGER NOT NULL, expires_at INTEGER,
+                  remaining_reads INTEGER CHECK (remaining_reads IS NULL OR remaining_reads > 0),
+                  revocation_verifier BLOB NOT NULL) STRICT;").unwrap();
+        }
+        let s = PersistentStore::open(&path, limits()).unwrap();
+        s.insert(&id(1), &share(Some(1), None, false), 0).unwrap();
+        assert!(s.consume(&id(1), 0, AccessCheck::none()).is_ok());
     }
 
     #[test]
@@ -639,7 +755,10 @@ mod tests {
             Err(StoreError::Forbidden)
         );
         s.revoke(&id(1), RevokeAuth::Token(b"rv"), 0).unwrap();
-        assert_eq!(s.consume(&id(1), 0).unwrap_err(), StoreError::Unavailable);
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none()).unwrap_err(),
+            StoreError::Unavailable
+        );
     }
 
     #[test]
@@ -649,7 +768,7 @@ mod tests {
         let handles: Vec<_> = (0..50)
             .map(|_| {
                 let s = Arc::clone(&s);
-                std::thread::spawn(move || s.consume(&id(9), 0).is_ok())
+                std::thread::spawn(move || s.consume(&id(9), 0, AccessCheck::none()).is_ok())
             })
             .collect();
         assert_eq!(

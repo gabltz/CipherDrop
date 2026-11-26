@@ -5,8 +5,8 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use cipherdrop_protocol::api::{
-    ConsumeShareResponse, CreateShareRequest, CreateShareResponse, Problem, Scope,
-    ShareStatusResponse, StorageBackend,
+    ConsumeShareRequest, ConsumeShareResponse, CreateShareRequest, CreateShareResponse, Problem,
+    Scope, ShareStatusResponse, StorageBackend,
 };
 use cipherdrop_protocol::encoding::b64_encode;
 use cipherdrop_protocol::url::{
@@ -14,9 +14,9 @@ use cipherdrop_protocol::url::{
 };
 use cipherdrop_protocol::{Algorithm, DecodedKdf, PROTOCOL_VERSION, ProtocolError};
 use cipherdrop_storage::{
-    Consumed, NewShare, RevokeAuth, ShareMeta, Status, StoreError, StoredEnvelope, Verifier,
+    AccessCheck, Consumed, NewShare, RevokeAuth, ShareMeta, Status, StoreError, StoredEnvelope,
+    Verifier,
 };
-use serde::Deserialize;
 
 use crate::config::Backend;
 use crate::error::ApiError;
@@ -135,6 +135,27 @@ pub async fn create_share(
         _ => ApiError::InvalidRequest("Malformed encryption envelope"),
     })?;
 
+    // --- server-enforced password gate ---
+    let access = match &req.access_verifier {
+        // Password-protected shares must be gated, so that holding the link
+        // without the password is never enough to burn the share.
+        None if decoded.kdf.is_some() => {
+            return Err(ApiError::InvalidRequest(
+                "access_verifier is required for password-protected (kdf) shares",
+            ));
+        }
+        None => None,
+        Some(_) if decoded.kdf.is_none() => {
+            return Err(ApiError::InvalidRequest(
+                "access_verifier is only valid for password-protected (kdf) shares",
+            ));
+        }
+        Some(v) => Some(Verifier(
+            cipherdrop_protocol::encoding::b64_decode_array::<32>(v, "access_verifier")
+                .map_err(|_| ApiError::InvalidRequest("Malformed access_verifier"))?,
+        )),
+    };
+
     // --- storage backend ---
     let backend = match req.storage {
         Some(b) => b,
@@ -216,10 +237,14 @@ pub async fn create_share(
         }
     }
 
-    let result = insert_share(
-        &state, &principal, backend, decoded, expires_at, max_reads, now,
-    )
-    .await;
+    let spec = ShareSpec {
+        backend,
+        decoded,
+        access,
+        expires_at,
+        max_reads,
+    };
+    let result = insert_share(&state, &principal, spec, now).await;
     match (&result, &idem_key) {
         (Ok(resp), Some(k)) if idem_active => state.idempotency.complete(&principal_key, k, resp),
         (Err(_), Some(k)) if idem_active => state.idempotency.abandon(&principal_key, k),
@@ -233,15 +258,28 @@ pub async fn create_share(
     Ok(res)
 }
 
+/// Validated parameters of a share to create.
+struct ShareSpec {
+    backend: StorageBackend,
+    decoded: cipherdrop_protocol::DecodedEnvelope,
+    access: Option<Verifier>,
+    expires_at: Option<u64>,
+    max_reads: Option<u32>,
+}
+
 async fn insert_share(
     state: &AppState,
     principal: &Principal,
-    backend: StorageBackend,
-    decoded: cipherdrop_protocol::DecodedEnvelope,
-    expires_at: Option<u64>,
-    max_reads: Option<u32>,
+    spec: ShareSpec,
     now: u64,
 ) -> Result<CreateShareResponse, ApiError> {
+    let ShareSpec {
+        backend,
+        decoded,
+        access,
+        expires_at,
+        max_reads,
+    } = spec;
     if let Principal::Token(t) = principal {
         t.charge_create(now)?;
     }
@@ -259,6 +297,7 @@ async fn insert_share(
             remaining_reads: max_reads,
         },
         revocation: Verifier::from_secret(revocation_token.as_bytes()),
+        access,
     };
     let res = match backend {
         StorageBackend::Memory => state.memory.insert(id, share, now),
@@ -305,11 +344,6 @@ async fn insert_share(
     })
 }
 
-/// Empty JSON object required by the consume endpoint.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ConsumeRequest {}
-
 /// Atomically consume one retrieval and return the ciphertext.
 ///
 /// This is the **only** endpoint that returns ciphertext. Validation and
@@ -317,20 +351,27 @@ pub struct ConsumeRequest {}
 /// number of concurrent requests succeeds. Do **not** retry automatically:
 /// a lost response after a successful consume cannot be recovered.
 ///
-/// Requires `Content-Type: application/json` and the body `{}`; this makes
-/// the request non-simple, so browsers cannot send it cross-site without a
-/// CORS preflight.
+/// Requires `Content-Type: application/json` and a JSON body (`{}`, or
+/// `{"access_key": "..."}` for password-gated shares); this makes the request
+/// non-simple, so browsers cannot send it cross-site without a CORS preflight.
+///
+/// For shares created with an `access_verifier`, the ciphertext is released
+/// only when `access_key` matches; a wrong or missing key returns `403
+/// access_denied` and consumes nothing. After `max_access_failures` wrong
+/// attempts the share is destroyed (`410 share_destroyed`).
 #[utoipa::path(
     post,
     path = "/api/v1/shares/{id}/consume",
     tag = "shares",
     params(("id" = String, Path, description = "Share id (22 characters)")),
-    request_body(content = ConsumeRequest, content_type = "application/json", example = json!({})),
+    request_body(content = ConsumeShareRequest, content_type = "application/json", example = json!({})),
     responses(
         (status = 200, description = "Ciphertext envelope", body = ConsumeShareResponse),
         (status = 400, description = "Malformed id or body", body = Problem, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "Missing or wrong access key (nothing consumed)", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "Share unavailable (unknown, expired, consumed or revoked)", body = Problem, content_type = "application/problem+json"),
+        (status = 410, description = "Destroyed after too many wrong access keys", body = Problem, content_type = "application/problem+json"),
         (status = 415, description = "Content-Type must be application/json", body = Problem, content_type = "application/problem+json"),
         (status = 429, description = "Rate limited", body = Problem, content_type = "application/problem+json"),
     ),
@@ -341,15 +382,37 @@ pub async fn consume_share(
     client: ClientInfo,
     principal: Principal,
     Path(id): Path<String>,
-    _body: StrictJson<ConsumeRequest>,
+    body: StrictJson<ConsumeShareRequest>,
 ) -> Result<Response, ApiError> {
     authorize_retrieval(&state, &principal, &client)?;
     let id = parse_id(&id)?;
+    let access_key = body
+        .value
+        .access_key
+        .as_deref()
+        .map(|k| {
+            cipherdrop_protocol::encoding::b64_decode_array::<32>(k, "access_key")
+                .map(zeroize::Zeroizing::new)
+                .map_err(|_| ApiError::InvalidRequest("Malformed access_key"))
+        })
+        .transpose()?;
+    let max_failures = state.config.shares.max_access_failures;
     let now = now_unix();
-    let (consumed, backend) = match state.memory.consume(&id, now) {
+    let check = AccessCheck {
+        key: access_key.as_ref().map(|k| &k[..]),
+        max_failures,
+    };
+    let (consumed, backend) = match state.memory.consume(&id, now, check) {
         Ok(c) => (c, StorageBackend::Memory),
         Err(StoreError::Unavailable) => (
-            consume_persistent(&state, id, now).await?,
+            consume_persistent(
+                &state,
+                id,
+                now,
+                access_key.as_ref().map(|k| **k),
+                max_failures,
+            )
+            .await?,
             StorageBackend::Persistent,
         ),
         Err(e) => return Err(e.into()),
@@ -371,10 +434,28 @@ pub async fn consume_share(
     Ok(no_store(Json(body)))
 }
 
-async fn consume_persistent(state: &AppState, id: ShareId, now: u64) -> Result<Consumed, ApiError> {
+async fn consume_persistent(
+    state: &AppState,
+    id: ShareId,
+    now: u64,
+    access_key: Option<[u8; 32]>,
+    max_failures: u32,
+) -> Result<Consumed, ApiError> {
     #[cfg(feature = "sqlite")]
     if let Some(store) = state.persistent_shares().cloned() {
-        return match tokio::task::spawn_blocking(move || store.consume(&id, now)).await {
+        return match tokio::task::spawn_blocking(move || {
+            let k = zeroize::Zeroizing::new(access_key);
+            store.consume(
+                &id,
+                now,
+                AccessCheck {
+                    key: k.as_ref().map(|k| &k[..]),
+                    max_failures,
+                },
+            )
+        })
+        .await
+        {
             Ok(Ok(c)) => Ok(c),
             Ok(Err(e)) => {
                 if e == StoreError::Unavailable {
@@ -385,7 +466,7 @@ async fn consume_persistent(state: &AppState, id: ShareId, now: u64) -> Result<C
             Err(_) => Err(ApiError::Internal),
         };
     }
-    let _ = (id, now);
+    let _ = (id, now, access_key, max_failures);
     Metrics::inc(&state.metrics.consume_unavailable);
     Err(ApiError::ShareUnavailable)
 }
@@ -427,6 +508,8 @@ pub async fn share_status(
         expires_at: st.expires_at.map(rfc3339),
         remaining_reads: st.remaining_reads,
         password_protected: st.password_protected,
+        access_protected: st.access_protected,
+        kdf: st.kdf.as_ref().map(DecodedKdf::to_wire),
         storage: backend,
     })))
 }

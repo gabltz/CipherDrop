@@ -29,6 +29,10 @@ pub enum ApiError {
     HttpsRequired,
     #[error("share unavailable")]
     ShareUnavailable,
+    #[error("access denied")]
+    AccessDenied,
+    #[error("share destroyed")]
+    ShareDestroyed,
     #[error("not found")]
     NotFound,
     #[error("idempotency key conflict")]
@@ -103,6 +107,20 @@ impl ApiError {
                 Some(
                     "The share does not exist, has expired, has already been retrieved the maximum number of times, or was revoked",
                 ),
+            ),
+            AccessDenied => (
+                StatusCode::FORBIDDEN,
+                "access_denied",
+                "Access denied",
+                Some(
+                    "This share requires its password: missing or wrong access key. Nothing was consumed",
+                ),
+            ),
+            ShareDestroyed => (
+                StatusCode::GONE,
+                "share_destroyed",
+                "Share destroyed",
+                Some("Too many wrong password attempts; the share has been deleted"),
             ),
             NotFound => (StatusCode::NOT_FOUND, "not_found", "Not found", None),
             IdempotencyConflict => (
@@ -222,6 +240,8 @@ impl From<cipherdrop_storage::StoreError> for ApiError {
             S::Forbidden => Self::Forbidden("Invalid revocation token"),
             S::CapacityExhausted => Self::CapacityExhausted,
             S::TooLarge => Self::PayloadTooLarge,
+            S::AccessDenied { destroyed: false } => Self::AccessDenied,
+            S::AccessDenied { destroyed: true } => Self::ShareDestroyed,
             S::Duplicate | S::Backend => Self::Internal,
         }
     }

@@ -29,12 +29,14 @@ use std::time::Duration;
 pub use cipherdrop_protocol as protocol;
 use cipherdrop_protocol::ProtocolError;
 use cipherdrop_protocol::api::{
-    ConfigResponse, ConsumeShareResponse, CreateShareRequest, CreateShareResponse, Problem,
-    ShareStatusResponse, StorageBackend,
+    ConfigResponse, ConsumeShareRequest, ConsumeShareResponse, CreateShareRequest,
+    CreateShareResponse, Problem, ShareStatusResponse, StorageBackend,
 };
 use cipherdrop_protocol::crypto::{
-    DEFAULT_PAD_TO, KdfCost, ShareKey, decrypt_payload, encrypt_payload,
+    DEFAULT_PAD_TO, KdfCost, ShareKey, decrypt_payload, decrypt_with_cek, derive_password_keys,
+    encrypt_payload_with_access,
 };
+use cipherdrop_protocol::encoding::b64_encode;
 use cipherdrop_protocol::payload::SecretPayload;
 use cipherdrop_protocol::url::{RevocationLink, ShareId, ShareLink};
 use secrecy::{ExposeSecret, SecretString};
@@ -296,8 +298,10 @@ impl Client {
             .password
             .as_ref()
             .map(|p| (p.expose_secret(), opts.kdf_cost.unwrap_or_default()));
-        let env = encrypt_payload(&key, payload, pw, DEFAULT_PAD_TO)?;
-        let mut body = CreateShareRequest::from_envelope(env.to_wire());
+        let enc = encrypt_payload_with_access(&key, payload, pw, DEFAULT_PAD_TO)?;
+        let mut body = CreateShareRequest::from_envelope(enc.envelope.to_wire());
+        // Server-enforced password gate: only SHA-256(access_key) is uploaded.
+        body.access_verifier = enc.access_verifier.map(|v| b64_encode(&v));
         body.ttl_seconds = if opts.never_expire {
             Some(None)
         } else {
@@ -358,13 +362,38 @@ impl Client {
         password: Option<&str>,
     ) -> Result<Zeroizing<SecretPayload>, Error> {
         let link = ShareLink::parse(link)?;
-        if password.is_none() && self.status(&link.share_id).await?.password_protected {
-            // Fail before consuming: a retrieval must not be burned without the password.
-            return Err(ProtocolError::PasswordRequired.into());
+        // Non-consuming status first: learn whether a password is needed and,
+        // for gated shares, the public KDF parameters to derive the access key.
+        let status = self.status(&link.share_id).await?;
+        match (password, status.password_protected) {
+            (None, true) => Err(ProtocolError::PasswordRequired.into()),
+            (Some(_), false) => Err(ProtocolError::PasswordNotExpected.into()),
+            (None, false) => {
+                let consumed = self.consume(&link.share_id).await?;
+                let env = consumed.envelope().decode(usize::MAX)?;
+                Ok(decrypt_payload(&link.key, &env, None)?)
+            }
+            (Some(pw), true) => {
+                let kdf = status
+                    .kdf
+                    .as_ref()
+                    .ok_or(ProtocolError::MalformedPayload)?
+                    .decode()?;
+                let keys = derive_password_keys(&link.key, &kdf, pw)?;
+                let access = status
+                    .access_protected
+                    .then(|| Zeroizing::new(b64_encode(keys.access_key.as_ref())));
+                let consumed = self
+                    .consume_with(&link.share_id, access.as_deref().map(String::as_str))
+                    .await?;
+                let env = consumed.envelope().decode(usize::MAX)?;
+                if env.kdf != Some(kdf) {
+                    return Err(ProtocolError::Decryption.into());
+                }
+                let bytes = decrypt_with_cek(&keys.cek, &env)?;
+                Ok(SecretPayload::from_bytes(&bytes).map(Zeroizing::new)?)
+            }
         }
-        let consumed = self.consume(&link.share_id).await?;
-        let env = consumed.envelope().decode(usize::MAX)?;
-        Ok(decrypt_payload(&link.key, &env, password)?)
     }
 
     /// Raw consume (returns the encrypted envelope).
@@ -372,13 +401,27 @@ impl Client {
     /// # Errors
     /// Transport or API errors.
     pub async fn consume(&self, id: &ShareId) -> Result<ConsumeShareResponse, Error> {
+        self.consume_with(id, None).await
+    }
+
+    /// Raw consume presenting an access key (password-gated shares).
+    ///
+    /// # Errors
+    /// Transport or API errors (`403 access_denied` for a wrong key; nothing is consumed).
+    pub async fn consume_with(
+        &self,
+        id: &ShareId,
+        access_key: Option<&str>,
+    ) -> Result<ConsumeShareResponse, Error> {
+        let body = ConsumeShareRequest {
+            access_key: access_key.map(str::to_owned),
+        };
         Self::send(
             self.req(
                 reqwest::Method::POST,
                 &format!("/api/v1/shares/{id}/consume"),
             )
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body("{}"),
+            .json(&body),
         )
         .await
     }

@@ -16,6 +16,7 @@ pub mod middleware;
 pub mod net;
 pub mod openapi;
 pub mod routes;
+pub mod serve;
 pub mod state;
 pub mod static_files;
 pub mod util;

@@ -150,7 +150,12 @@ struct Fail(u8, String);
 impl From<Error> for Fail {
     fn from(e: Error) -> Self {
         let code = match &e {
-            Error::Api { status: 404, .. } => 3,
+            Error::Api {
+                problem: Some(p), ..
+            } if p.code == "access_denied" => 5,
+            Error::Api {
+                status: 404 | 410, ..
+            } => 3,
             Error::Api {
                 status: 401 | 403, ..
             } => 4,

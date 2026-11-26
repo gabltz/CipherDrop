@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use cipherdrop_protocol::url::ShareId;
 use cipherdrop_storage::memory::{ENTRY_OVERHEAD_BYTES, MemoryLimits, MemoryStore};
-use cipherdrop_storage::{NewShare, RevokeAuth, ShareMeta, StoreError, StoredEnvelope, Verifier};
+use cipherdrop_storage::{
+    AccessCheck, NewShare, RevokeAuth, ShareMeta, StoreError, StoredEnvelope, Verifier,
+};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -95,6 +97,7 @@ proptest! {
                             remaining_reads: reads.map(u32::from),
                         },
                         revocation: Verifier::from_secret(b"good"),
+                        access: None,
                     };
                     let r = store.insert(sid(id), share, now);
                     // Model: an insert reclaims expired entries when full.
@@ -122,7 +125,7 @@ proptest! {
                     }
                 }
                 Op::Consume { id } => {
-                    let r = store.consume(&sid(id), now);
+                    let r = store.consume(&sid(id), now, AccessCheck::none());
                     if live(&model, id, now) {
                         let e = model.get_mut(&id).unwrap();
                         let c = r.expect("live share must be consumable");

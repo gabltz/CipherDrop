@@ -1,5 +1,5 @@
 {
-  "description": "CipherDrop protocol v1 deterministic test vectors. Synthetic data only. Valid vectors: implementations MUST decrypt `envelope` with `key` (+ `password`) to exactly `plaintext`, and MUST reproduce `envelope.ciphertext` when encrypting `plaintext` with the given key, nonce, password and KDF salt. Invalid vectors: implementations MUST reject them; `malformed` errors are raised while decoding the envelope, `decryption` errors by AES-GCM authentication.",
+  "description": "CipherDrop protocol v1 deterministic test vectors. Synthetic data only. Valid vectors: implementations MUST decrypt `envelope` with `key` (+ `password`) to exactly `plaintext`, and MUST reproduce `envelope.ciphertext` when encrypting `plaintext` with the given key, nonce, password and KDF salt. For password vectors, `access_key_hex` is HKDF-Expand(PRK, \"cipherdrop/v1/access\", 32) and `access_verifier` is base64url(SHA-256(access_key)). Invalid vectors: implementations MUST reject them; `malformed` errors are raised while decoding the envelope, `decryption` errors by AES-GCM authentication.",
   "invalid": [
     {
       "envelope": {
@@ -128,6 +128,8 @@
   "vectors": [
     {
       "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "access_key_hex": null,
+      "access_verifier": null,
       "cek_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       "description": "Minimal payload, no password, no padding.",
       "envelope": {
@@ -144,6 +146,8 @@
     },
     {
       "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "access_key_hex": null,
+      "access_verifier": null,
       "cek_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
       "description": "Title, syntax hint, non-ASCII content; payload padded with spaces to 256 bytes.",
       "envelope": {
@@ -160,6 +164,8 @@
     },
     {
       "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "access_key_hex": null,
+      "access_verifier": null,
       "cek_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "description": "Empty content string.",
       "envelope": {
@@ -176,6 +182,8 @@
     },
     {
       "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=argon2id;v=19;m=19456;t=2;p=1;salt=MDEyMzQ1Njc4OTo7PD0-Pw",
+      "access_key_hex": "268430fc6919cad3db910abedc553d2fd415371a5a64cfbf444bc4d89547f0c2",
+      "access_verifier": "W_2bw2TEUllTY8w_qmvfWan2M27ttKbg2tnglgUuv1A",
       "cek_hex": "ccc9c8e7bbc22af68a05596e2127585fcdb38e39e92a0e6fd50f3d348628ac6e",
       "description": "Password-protected share using minimum Argon2id cost (19456 KiB, t=2, p=1).",
       "envelope": {
@@ -199,6 +207,8 @@
     },
     {
       "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=argon2id;v=19;m=19456;t=2;p=1;salt=UFFSU1RVVldYWVpbXF1eXw",
+      "access_key_hex": "6315a6dae8d6782b8e788f387b2563127f61c1f5a03be4ac128d7ad008e0348f",
+      "access_verifier": "O0lHHZpeHuV_aJ6U4dhiLo8LJuoOWij6smsU0D9LSA8",
       "cek_hex": "b680a55bf7a9d65367abf2dd62ac9eaf9a19b3d8f21216f1bb35a8a88ac9109d",
       "description": "Password containing U+00E9; must be NFC-normalized before Argon2id. Decrypting with the decomposed form \"cafe\\u0301-\\u00fcber\" must also succeed.",
       "envelope": {
