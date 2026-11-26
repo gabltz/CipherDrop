@@ -35,12 +35,13 @@ Status: design-level threat model for v0.1.0. CipherDrop has **not** been indepe
 | T5 | Brute-force of share ids | 128-bit random ids; uniform 404; per-IP rate limits | None practical |
 | T6 | Offline guessing of share key | 256-bit random key | None practical |
 | T7 | Offline guessing of password (attacker has full link + ciphertext) | Argon2id (≥19 MiB, ≥2 passes) + HKDF with random key | Weak passwords remain guessable |
+| T7b | Online guessing / burning of a password share by a link holder | Server-enforced access key (derived from K + password) checked atomically before release; wrong keys consume nothing; share destroyed after `max_access_failures` | A link holder can deliberately destroy a password share by failing repeatedly |
 | T8 | Double reveal of one-time share (race) | Atomic check-and-decrement under one shard lock / `BEGIN IMMEDIATE` transaction; tested with 100 concurrent consumers | None known |
 | T9 | Link scanners burn secrets | GET/HEAD never consume; consume needs POST + `application/json` + explicit click; `noindex`, `robots.txt`, no preview metadata | Bots that execute JS and click buttons |
 | T10 | CSRF: foreign site burns a share | Non-simple request required (preflight); CORS denied by default; `Origin`/`Sec-Fetch-Site` validation | Requires attacker to know the share id anyway |
 | T11 | XSS via shared content | Content rendered as text or via escaping highlighter; strict CSP without `unsafe-inline`; no raw HTML in docs | Browser bugs |
 | T12 | Key leaks via Referer, logs, history | Fragment never sent; `Referrer-Policy: no-referrer`; logs contain route templates only (tested); fragment stripped from history on reveal | History/sync/extensions that recorded the URL before reveal |
-| T13 | Resource exhaustion | Body limit, ciphertext limit, memory and share-count budgets (reject, never evict), concurrency limit with load shedding, timeouts, rate limits, bounded idempotency cache, KDF upper bounds | Volumetric DDoS needs upstream protection |
+| T13 | Resource exhaustion | Connection caps (global and per IP), header-read, keep-alive and TLS-handshake timeouts, per-client in-flight cap, body limit, ciphertext limit, memory and share-count budgets (reject, never evict), concurrency limit with load shedding, timeouts, rate limits, bounded idempotency cache, KDF upper bounds | Volumetric DDoS needs upstream protection |
 | T14 | Forged `X-Forwarded-For` to evade limits | Forwarded headers honoured only from configured trusted proxies; right-most untrusted hop used | Misconfigured `trusted_proxies` |
 | T15 | Host header injection into links | Links built only from configured `public_url` | None |
 | T16 | Persistent data remanence | RAM-only default; persistent opt-in only with scope; `secure_delete`; ids stored hashed; 0600 file | SSD/FS journals, snapshots, backups (documented) |

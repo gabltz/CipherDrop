@@ -88,6 +88,7 @@ Idempotency-Key: 6f1e0c8a-retry-safe      (optional)
 | `ttl_seconds` | Omit for the default. `min_ttl_seconds..=max_ttl_seconds`. `null` = never expires (needs `allow_permanent` and `shares:create:persistent`) |
 | `max_reads` | Omit for the default. `1..=max_reads`. `null` = unlimited until expiry (needs `allow_unlimited_reads`) |
 | `storage` | `"memory"` (default) or `"persistent"` (needs `persistent_enabled` and `shares:create:persistent`) |
+| `access_verifier` | **Required when `kdf` is present**: `base64url(SHA-256(access_key))` (43 chars). The server then demands the matching `access_key` on consume (see [Encryption § access key](encryption.md#server-enforced-password-access-key)) |
 
 Response `201 Created`:
 
@@ -115,7 +116,9 @@ Content-Type: application/json
 {}
 ```
 
-The `Content-Type: application/json` header and the `{}` body are **required**. They make the request "non-simple", so browsers cannot send it cross-site without a CORS preflight, which CipherDrop denies by default.
+For password-protected shares the body is `{"access_key": "<base64url 32 bytes>"}`; a missing or wrong key returns `403 access_denied` and consumes nothing, and after `max_access_failures` wrong keys the share is destroyed (`410 share_destroyed`).
+
+The `Content-Type: application/json` header and a JSON body are **required**. They make the request "non-simple", so browsers cannot send it cross-site without a CORS preflight, which CipherDrop denies by default.
 
 Response `200 OK`:
 
@@ -134,7 +137,7 @@ Response `200 OK`:
 
 ### Status (non-consuming)
 
-`GET /api/v1/shares/{id}/status` returns `{available, expires_at, remaining_reads, password_protected, storage}` or `404`. It never changes the read counter, so it is safe for monitoring and link checkers.
+`GET /api/v1/shares/{id}/status` returns `{available, expires_at, remaining_reads, password_protected, access_protected, kdf, storage}` or `404`. `kdf` (public Argon2id parameters) is present for password-protected shares so that clients can derive the access key before consuming. It never changes the read counter, so it is safe for monitoring and link checkers.
 
 ### Revoke
 
@@ -166,14 +169,16 @@ Or with an API token holding `shares:revoke` (no revocation token needed). Respo
 | 403 | `feature_disabled` | Persistent storage, permanent or unlimited shares disabled |
 | 403 | `cross_origin_rejected` | State-changing request from a disallowed `Origin` |
 | 403 | `https_required` | Plain HTTP reported by a trusted proxy while HTTPS is required |
+| 403 | `access_denied` | Missing or wrong access key for a password-protected share (nothing consumed) |
 | 404 | `share_unavailable` | Unknown, expired, consumed or revoked |
+| 410 | `share_destroyed` | Destroyed after too many wrong access keys |
 | 404 | `not_found` | Unknown route or token |
 | 405 | – | Wrong method (e.g. `GET /consume`) |
 | 408 | `timeout` | Request exceeded `request_timeout_seconds` |
 | 413 | `payload_too_large` | Ciphertext or body exceeds the limit |
 | 415 | `unsupported_media_type` | Missing `Content-Type: application/json` |
 | 422 | `idempotency_key_reused` | Same `Idempotency-Key` with a different body |
-| 429 | `rate_limited` | Rate limit exceeded (`Retry-After` header) |
+| 429 | `rate_limited` | Rate limit or per-client concurrency limit exceeded (`Retry-After` header) |
 | 429 | `quota_exceeded` | Token's daily creation quota exhausted |
 | 503 | `overloaded` | Concurrency limit reached (`Retry-After`) |
 | 507 | `capacity_exhausted` | Memory or share-count budget exhausted (`Retry-After`). Existing shares are never evicted |
@@ -186,6 +191,7 @@ Error bodies never echo request content, identifiers or tokens.
 - Anonymous consume/status/revoke: `rate_limit.read_per_minute` per client IP (default 120).
 - Authenticated requests: per token, `rate_limit_per_minute` on the token or `token_default_per_minute` (default 600).
 - IPv6 clients are grouped by `/64` (configurable).
+- Concurrency: at most `max_concurrent_requests_per_ip` (default 32) in-flight requests per client and `max_connections_per_ip` (default 64) TCP connections per peer (trusted proxies exempt). Request headers must arrive within `header_read_timeout_seconds` (default 10, which also closes idle keep-alive connections).
 - Client IPs come from the TCP peer unless the peer is a configured trusted proxy (see [Configuration](configuration.md#security)).
 
 ## Retry semantics

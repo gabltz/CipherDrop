@@ -17,6 +17,10 @@ Unknown keys are rejected. The configuration is validated at startup (`cipherdro
 | `listen` | `"127.0.0.1:8080"` | Listen address |
 | `public_url` | **required** | Base URL for share links. Share links are never derived from the `Host` header |
 | `max_concurrent_requests` | `256` | Requests beyond this get `503` immediately (no unbounded queue) |
+| `max_concurrent_requests_per_ip` | `32` | In-flight requests per client IP (`429` beyond), so that one client cannot hold every slot |
+| `max_connections` | `4096` | Open TCP connections; new connections beyond are refused |
+| `max_connections_per_ip` | `64` | Open TCP connections per peer IP; configured trusted proxies are exempt |
+| `header_read_timeout_seconds` | `10` | Time to receive request headers; also closes idle keep-alive connections (slowloris defence) |
 | `shutdown_grace_seconds` | `10` | Drain time on `SIGTERM` |
 | `tls.cert_path`, `tls.key_path` | none | Enable native HTTPS (PEM) |
 
@@ -46,6 +50,7 @@ Unknown keys are rejected. The configuration is validated at startup (`cipherdro
 | `max_reads` | `100` | Maximum `max_reads` (≤ 1,000,000) |
 | `allow_permanent` | `false` | Allow `ttl_seconds: null` for callers with `shares:create:persistent` |
 | `allow_unlimited_reads` | `false` | Allow `max_reads: null` |
+| `max_access_failures` | `10` | Wrong access-password attempts after which a password-protected share is destroyed (1–1000) |
 
 ## `[auth]`
 

@@ -19,8 +19,9 @@ cipherdrop/
 ## Request path
 
 ```text
-TCP → (TLS: rustls | trusted reverse proxy) → edge middleware
-      ├─ concurrency semaphore (try_acquire → 503, no queue)
+TCP accept loop (global + per-IP connection caps, TLS handshake and header-read timeouts)
+    → (TLS: rustls | trusted reverse proxy) → edge middleware
+      ├─ concurrency semaphore (try_acquire → 503, no queue) + per-client in-flight cap (429)
       ├─ client IP / scheme resolution (trusted proxies only)
       ├─ HTTPS enforcement, Origin validation for unsafe methods
       ├─ request timeout
@@ -43,6 +44,8 @@ TCP → (TLS: rustls | trusted reverse proxy) → edge middleware
 | **Lazy-deletion expiry min-heap with compaction** | O(k log n) reclamation of k expired entries; no periodic full scans; heap bounded to O(live) |
 | **Global accounting mutex, reject when full** | Exact budgets without eviction surprises |
 | **No tombstones; uniform 404** | No metadata retained about consumed/revoked shares; no oracle |
+| **Server-enforced password via access key** = HKDF-Expand(PRK(K ‖ Argon2id(pw)), "cipherdrop/v1/access") | Stops link holders from burning password shares and bounds online guessing, while the server never learns the password and cannot attack the verifier offline (needs K) |
+| **Own accept loop (hyper-util + tokio-rustls)** instead of `axum::serve`/axum-server | Neither bounds connections or header-read time by default (slowloris, found in the audit) |
 | **POST + JSON content type for consume** | Defeats link scanners, prefetchers and simple-request CSRF |
 | **SQLite via rusqlite (bundled), single connection, `BEGIN IMMEDIATE`** | Simple, transactional counters; no external service; persistent path is fully separate |
 | **SHA-256 verifiers for API/revocation tokens** | Tokens have 256-bit entropy; slow hashing adds no security |
