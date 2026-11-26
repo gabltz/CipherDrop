@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1.7
+# Base images are pinned by digest (Dependabot keeps them current).
 # CipherDrop: multi-stage build producing a static binary on an empty (scratch) base.
 #   docker build -t cipherdrop .
 #   docker buildx build --platform linux/amd64,linux/arm64 -t cipherdrop .
 
 # ---- 1. Frontend (Svelte + TypeScript SDK) ----------------------------------
-FROM node:24-alpine AS frontend
+FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS frontend
 WORKDIR /src
 COPY package.json package-lock.json .npmrc ./
 COPY sdk/typescript/package.json sdk/typescript/
@@ -18,7 +19,7 @@ COPY docs docs
 RUN npm run build -w cipherdrop-frontend
 
 # ---- 2. Rust (static musl binaries) -----------------------------------------
-FROM rust:1.99-alpine AS rust
+FROM rust:1.99-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS rust
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -35,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && /out/cipherdrop-server --version
 
 # CA bundle for outbound TLS (only the CLI uses it; the server makes no outbound requests).
-FROM alpine:3 AS certs
+FROM alpine:3@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS certs
 RUN apk add --no-cache ca-certificates
 
 # ---- 3. Runtime --------------------------------------------------------------
