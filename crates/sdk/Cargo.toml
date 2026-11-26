@@ -1,0 +1,26 @@
+[package]
+name = "cipherdrop-sdk"
+description = "Rust client for CipherDrop: local encryption plus the /api/v1 HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cipherdrop-protocol = { path = "../protocol" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "rustls-no-provider", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+secrecy = "0.10"
+zeroize = "1.9"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+cipherdrop-server = { path = "../server", default-features = false, features = ["sqlite"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
