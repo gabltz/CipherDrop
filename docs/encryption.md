@@ -35,7 +35,27 @@ PWK  = Argon2id(password = PW, salt = salt, m = memory_kib, t = iterations,
 CEK  = HKDF-SHA256(salt = salt, IKM = K ‖ PWK, info = "cipherdrop/v1/cek/password", L = 32)
 ```
 
+```text
+PRK        = HKDF-Extract(salt = salt, IKM = K ‖ PWK)
+CEK        = HKDF-Expand(PRK, info = "cipherdrop/v1/cek/password", L = 32)
+access_key = HKDF-Expand(PRK, info = "cipherdrop/v1/access",       L = 32)
+```
+
 The password *supplements* the random key and never replaces it. Decrypting needs both the complete link and the password. Offline guessing of the password is only possible for an attacker who already holds the full link (including `K`) and the ciphertext. Each guess then costs one Argon2id evaluation with the sender's parameters. Empty passwords MUST be rejected.
+
+## Server-enforced password (access key)
+
+For password-protected shares, the server also verifies the password, without ever learning it, before releasing any ciphertext:
+
+1. At creation the client sends `access_verifier = base64url(SHA-256(access_key))`. It is **required** whenever `kdf` is present.
+2. The recipient obtains the public KDF parameters from the non-consuming `GET /status` (`kdf`, `access_protected: true`), derives `access_key` (one Argon2id evaluation yields both `CEK` and `access_key`), and sends `{"access_key": "<base64url>"}` in the consume body.
+3. Inside the same atomic step that consumes a retrieval, the server compares `SHA-256(access_key)` with the stored verifier in constant time. A missing or wrong key returns `403 access_denied` **and consumes nothing**. After `shares.max_access_failures` wrong attempts (default 10) the share is destroyed (`410 share_destroyed`), which bounds online guessing.
+
+Properties:
+
+- The server sees `access_key` only on consume, and stores only its SHA-256. `access_key` and `CEK` are independent HKDF outputs: knowing one reveals nothing about the other.
+- The server cannot run an offline dictionary attack against the verifier, because deriving any candidate requires the 256-bit share key `K`, which it never receives.
+- Someone who has the link but not the password can no longer burn a one-time share.
 
 ## Plaintext payload
 
@@ -111,9 +131,9 @@ revocation link:  {public_url}/revoke/{share_id}#v1.{revocation_token}
 ## Decryption and error handling
 
 1. Parse the link and validate `share_id` and `K`. On failure: *malformed link*. Do not contact the server.
-2. `POST /api/v1/shares/{id}/consume`. On `404`: *unavailable*. Never retry automatically.
+2. `GET /status` (non-consuming), then `POST /api/v1/shares/{id}/consume`. On `404`: *unavailable*. Never retry automatically.
 3. Validate the envelope. On failure: *malformed envelope*.
-4. If `kdf` is present, obtain the password and derive the CEK. Keep the envelope in memory, so password retries do not consume another retrieval.
+4. If `kdf` is present, obtain the password and derive `CEK` and `access_key` *before* consuming (using `kdf` from `/status`), and present `access_key` on consume. Wrong passwords are rejected by the server without consuming anything.
 5. Decrypt with the AAD. On authentication failure, report one generic error: *wrong key, wrong password, or modified data*. Implementations MUST NOT reveal which.
 6. Parse the payload; on failure: *malformed payload*.
 
@@ -142,6 +162,8 @@ password    correct horse battery staple
 salt        MDEyMzQ1Njc4OTo7PD0-Pw                           (bytes 30 31 … 3f)
 kdf         argon2id m=19456 t=2 p=1
 cek (hex)   ccc9c8e7bbc22af68a05596e2127585fcdb38e39e92a0e6fd50f3d348628ac6e
+access key  268430fc6919cad3db910abedc553d2fd415371a5a64cfbf444bc4d89547f0c2   (hex)
+verifier    W_2bw2TEUllTY8w_qmvfWan2M27ttKbg2tnglgUuv1A                          (base64url SHA-256)
 nonce       EBESExQVFhcYGRob
 aad         cipherdrop/v1;alg=AES-256-GCM;kdf=argon2id;v=19;m=19456;t=2;p=1;salt=MDEyMzQ1Njc4OTo7PD0-Pw
 plaintext   {"content":"password protected synthetic secret","title":"PW test"}
