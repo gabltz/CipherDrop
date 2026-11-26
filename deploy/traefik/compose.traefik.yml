@@ -1,0 +1,48 @@
+# CipherDrop behind Traefik v3 (labels). Replace paste.example.com and the ACME email.
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=admin@example.com
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --accesslog=false
+    ports: ["80:80", "443:443"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    networks: [proxy]
+
+  cipherdrop:
+    image: cipherdrop:latest
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    memswap_limit: 256m
+    ulimits: { core: 0 }
+    environment:
+      CIPHERDROP__SERVER__PUBLIC_URL: "https://paste.example.com"
+      CIPHERDROP__SECURITY__TRUST_FORWARDED_HEADERS: "true"
+      CIPHERDROP__SECURITY__TRUSTED_PROXIES: '["172.31.0.0/24"]'
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.cipherdrop.rule=Host(`paste.example.com`)
+      - traefik.http.routers.cipherdrop.entrypoints=websecure
+      - traefik.http.routers.cipherdrop.tls.certresolver=le
+      - traefik.http.services.cipherdrop.loadbalancer.server.port=8080
+      - traefik.http.middlewares.cd-limit.buffering.maxRequestBodyBytes=2097152
+    networks: [proxy]
+
+networks:
+  proxy:
+    ipam:
+      config: [{ subnet: 172.31.0.0/24 }]
+
+volumes:
+  letsencrypt:

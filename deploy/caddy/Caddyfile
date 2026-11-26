@@ -1,0 +1,19 @@
+{
+	# No telemetry, no admin API exposure.
+	admin off
+}
+
+{$CIPHERDROP_DOMAIN:localhost} {
+	encode zstd gzip
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy cipherdrop:8080 {
+		# Stream bodies; never spool to disk.
+		flush_interval -1
+	}
+	# Access logs would contain share ids: discard them.
+	log {
+		output discard
+	}
+}

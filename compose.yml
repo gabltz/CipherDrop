@@ -1,0 +1,67 @@
+# Production-style deployment: CipherDrop behind Caddy (automatic HTTPS).
+#
+#   CIPHERDROP_DOMAIN=paste.example.com docker compose up -d --build
+#
+# With the default CIPHERDROP_DOMAIN=localhost, Caddy issues a certificate from
+# its internal CA (browsers will warn); use a real domain for public HTTPS.
+# CipherDrop itself needs no volume: shares live in RAM only.
+
+name: cipherdrop
+
+services:
+  cipherdrop:
+    build: .
+    image: cipherdrop:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    memswap_limit: 256m          # same as mem_limit: no swap for this container
+    cpus: 1.0
+    pids_limit: 128
+    ulimits:
+      core: 0
+    environment:
+      CIPHERDROP__SERVER__LISTEN: "0.0.0.0:8080"
+      CIPHERDROP__SERVER__PUBLIC_URL: "https://${CIPHERDROP_DOMAIN:-localhost}${CIPHERDROP_PUBLIC_PORT_SUFFIX:-}"
+      CIPHERDROP__SECURITY__TRUST_FORWARDED_HEADERS: "true"
+      CIPHERDROP__SECURITY__TRUSTED_PROXIES: '["172.30.0.0/24"]'
+      CIPHERDROP__STORAGE__MAX_MEMORY_MB: "128"
+      CIPHERDROP__AUTH__ANONYMOUS_CREATION: "${CIPHERDROP_ANONYMOUS_CREATION:-false}"
+      CIPHERDROP__LOGGING__LEVEL: "warn"
+    # Optional static API tokens / other settings: mount a config file read-only.
+    #   volumes: ["./config.toml:/etc/cipherdrop/config.toml:ro"]
+    #   command: ["serve", "--config", "/etc/cipherdrop/config.toml"]
+    networks: [internal]
+    expose: ["8080"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      cipherdrop:
+        condition: service_healthy
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CIPHERDROP_DOMAIN: "${CIPHERDROP_DOMAIN:-localhost}"
+    ports:
+      - "${CIPHERDROP_HTTP_PORT:-80}:80"
+      - "${CIPHERDROP_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data         # TLS certificates (no share data)
+      - caddy_config:/config
+    networks: [internal]
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:

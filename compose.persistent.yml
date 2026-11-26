@@ -1,0 +1,21 @@
+# Overlay enabling explicitly persistent shares (SQLite, encrypted payloads only):
+#   docker compose -f compose.yml -f compose.persistent.yml up -d
+# Grant `shares:create:persistent` only to administrators' tokens.
+services:
+  cipherdrop:
+    environment:
+      CIPHERDROP__STORAGE__PERSISTENT_ENABLED: "true"
+      CIPHERDROP__STORAGE__SQLITE_PATH: "/data/cipherdrop.sqlite3"
+    volumes:
+      - cipherdrop_data:/data
+
+  # One-shot helper giving the non-root UID ownership of the volume.
+  cipherdrop-init:
+    image: alpine:3
+    command: ["sh", "-c", "chown 65532:65532 /data && chmod 0700 /data"]
+    volumes:
+      - cipherdrop_data:/data
+    network_mode: none
+
+volumes:
+  cipherdrop_data:
