@@ -1,0 +1,40 @@
+{
+  "name": "@cipherdrop/sdk",
+  "version": "0.1.0",
+  "description": "CipherDrop client: local AES-256-GCM encryption plus the /api/v1 HTTP API",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run && npm run build && node --test test/javascript.test.mjs",
+    "test:js": "node --test test/javascript.test.mjs"
+  },
+  "dependencies": {
+    "hash-wasm": "4.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.11",
+    "eslint": "10.15.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.74.0",
+    "vitest": "5.1.2"
+  }
+}

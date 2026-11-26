@@ -1,0 +1,14 @@
+{
+  "name": "cipherdrop-workspace",
+  "private": true,
+  "license": "MIT",
+  "workspaces": ["sdk/typescript", "frontend", "tests/e2e"],
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "build": "npm run build -w @cipherdrop/sdk && npm run build -w cipherdrop-frontend",
+    "test": "npm test -w @cipherdrop/sdk",
+    "lint": "npm run lint -w @cipherdrop/sdk && npm run lint -w cipherdrop-frontend",
+    "check": "npm run check -w @cipherdrop/sdk && npm run check -w cipherdrop-frontend",
+    "e2e": "npm test -w cipherdrop-e2e"
+  }
+}
