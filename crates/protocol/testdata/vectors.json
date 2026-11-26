@@ -1,0 +1,224 @@
+{
+  "description": "CipherDrop protocol v1 deterministic test vectors. Synthetic data only. Valid vectors: implementations MUST decrypt `envelope` with `key` (+ `password`) to exactly `plaintext`, and MUST reproduce `envelope.ciphertext` when encrypting `plaintext` with the given key, nonce, password and KDF salt. Invalid vectors: implementations MUST reject them; `malformed` errors are raised while decoding the envelope, `decryption` errors by AES-GCM authentication.",
+  "invalid": [
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-A6",
+        "nonce": "AAECAwQFBgcICQoL",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "modified-ciphertext",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAECAwQFBgcICQAL",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "modified-nonce",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAECAwQFBgcICQoL",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "ERERERERERERERERERERERERERERERERERERERERERE",
+      "name": "wrong-key",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "nBhL_uv-Dh_YionCjyfrwWyIJyEjDPscZTmxa7bfyRXyDjnPMp5axOdnr6KGzsF9D21YVzYmBiETqoeJHqwDhDTyJgElEy_1uEgeYMCb0hR3ky8",
+        "kdf": {
+          "algorithm": "argon2id",
+          "iterations": 2,
+          "memory_kib": 19456,
+          "parallelism": 1,
+          "salt": "MDEyMzQ1Njc4OTo7PD0-Pw"
+        },
+        "nonce": "EBESExQVFhcYGRob",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+      "name": "wrong-password",
+      "password": "Correct horse battery staple"
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "nBhL_uv-Dh_YionCjyfrwWyIJyEjDPscZTmxa7bfyRXyDjnPMp5axOdnr6KGzsF9D21YVzYmBiETqoeJHqwDhDTyJgElEy_1uEgeYMCb0hR3ky8",
+        "kdf": {
+          "algorithm": "argon2id",
+          "iterations": 3,
+          "memory_kib": 19456,
+          "parallelism": 1,
+          "salt": "MDEyMzQ1Njc4OTo7PD0-Pw"
+        },
+        "nonce": "EBESExQVFhcYGRob",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+      "name": "modified-kdf-iterations",
+      "password": "correct horse battery staple"
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "nBhL_uv-Dh_YionCjyfrwWyIJyEjDPscZTmxa7bfyRXyDjnPMp5axOdnr6KGzsF9D21YVzYmBiETqoeJHqwDhDTyJgElEy_1uEgeYMCb0hR3ky8",
+        "nonce": "EBESExQVFhcYGRob",
+        "version": 1
+      },
+      "expected_error": "decryption",
+      "key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+      "name": "stripped-kdf",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAECAwQFBgcICQoL",
+        "version": 2
+      },
+      "expected_error": "malformed",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "unsupported-version",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAECAwQFBgcICQoL==",
+        "version": 1
+      },
+      "expected_error": "malformed",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "padded-base64",
+      "password": null
+    },
+    {
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAAAAAAAAAA",
+        "version": 1
+      },
+      "expected_error": "malformed",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "short-nonce",
+      "password": null
+    }
+  ],
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "cek_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "description": "Minimal payload, no password, no padding.",
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "PCC1dKuRp3X5Y62p-YwUAez6p3eZCzcZSiOX6m1IIs-3N7ok3JAc-jf2ZFEUq-Y6",
+        "nonce": "AAECAwQFBgcICQoL",
+        "version": 1
+      },
+      "fragment": "v1.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "basic",
+      "password": null,
+      "plaintext": "{\"content\":\"Hello, CipherDrop!\"}"
+    },
+    {
+      "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "cek_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "description": "Title, syntax hint, non-ASCII content; payload padded with spaces to 256 bytes.",
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "rK1lUIyf-UMNTXvc79IQm45-m-_FT_5xjPzOusmyDJE04x4t4Xh4g68oayKdc0Llwqi_8AxsnjAq7wl1Lfz8q9v3x0xw1M27QlZaAtI9bcnyY9cwYjg2UpPe8j8D6ZTkjJZv7AEupt-lWzBe7iwjPS1Qt70PibNu5otEIb5s-6PC_PhMQBrqz7jqRmH00RWWqBhiTYp12R7VgkV4GuNThYkM-c4saDKEOcVvQ0deVa2vkjGtKHjZpWyt3FVv8IZ47bgaMnPFdyTOGPY_StIgcvSr3rF0FHTvOyDRkfuN2pkTRniuFenHE8loN3BdXobQ-wQDnULdOYyNUAK_DdMFCix5YPPrIMMrScrQaOW-zJw",
+        "nonce": "oKGio6Slpqeoqaqr",
+        "version": 1
+      },
+      "fragment": "v1.QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "key": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+      "name": "title-syntax-unicode-padded",
+      "password": null,
+      "plaintext": "{\"content\":\"fn main() {\\n    println!(\\\"Grüße, 世界 🔐\\\");\\n}\\n\",\"title\":\"Synthetic snippet\",\"syntax\":\"rust\"}                                                                                                                                             "
+    },
+    {
+      "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=none",
+      "cek_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "description": "Empty content string.",
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "vOsOkKPopXFmJH_u3llwRlP3aHWnaUOZHCQslpoA",
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "version": 1
+      },
+      "fragment": "v1.__________________________________________8",
+      "key": "__________________________________________8",
+      "name": "empty-content",
+      "password": null,
+      "plaintext": "{\"content\":\"\"}"
+    },
+    {
+      "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=argon2id;v=19;m=19456;t=2;p=1;salt=MDEyMzQ1Njc4OTo7PD0-Pw",
+      "cek_hex": "ccc9c8e7bbc22af68a05596e2127585fcdb38e39e92a0e6fd50f3d348628ac6e",
+      "description": "Password-protected share using minimum Argon2id cost (19456 KiB, t=2, p=1).",
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "nBhL_uv-Dh_YionCjyfrwWyIJyEjDPscZTmxa7bfyRXyDjnPMp5axOdnr6KGzsF9D21YVzYmBiETqoeJHqwDhDTyJgElEy_1uEgeYMCb0hR3ky8",
+        "kdf": {
+          "algorithm": "argon2id",
+          "iterations": 2,
+          "memory_kib": 19456,
+          "parallelism": 1,
+          "salt": "MDEyMzQ1Njc4OTo7PD0-Pw"
+        },
+        "nonce": "EBESExQVFhcYGRob",
+        "version": 1
+      },
+      "fragment": "v1.gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+      "key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+      "name": "password",
+      "password": "correct horse battery staple",
+      "plaintext": "{\"content\":\"password protected synthetic secret\",\"title\":\"PW test\"}"
+    },
+    {
+      "aad": "cipherdrop/v1;alg=AES-256-GCM;kdf=argon2id;v=19;m=19456;t=2;p=1;salt=UFFSU1RVVldYWVpbXF1eXw",
+      "cek_hex": "b680a55bf7a9d65367abf2dd62ac9eaf9a19b3d8f21216f1bb35a8a88ac9109d",
+      "description": "Password containing U+00E9; must be NFC-normalized before Argon2id. Decrypting with the decomposed form \"cafe\\u0301-\\u00fcber\" must also succeed.",
+      "envelope": {
+        "algorithm": "AES-256-GCM",
+        "ciphertext": "FMvhb-iTFh4WuA5POTMwsZfx9Y29jQxYrUnq1fyTBrfd",
+        "kdf": {
+          "algorithm": "argon2id",
+          "iterations": 2,
+          "memory_kib": 19456,
+          "parallelism": 1,
+          "salt": "UFFSU1RVVldYWVpbXF1eXw"
+        },
+        "nonce": "ICEiIyQlJicoKSor",
+        "version": 1
+      },
+      "fragment": "v1.wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8",
+      "key": "wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t8",
+      "name": "password-nfc",
+      "password": "café-über",
+      "plaintext": "{\"content\":\"nfc\"}"
+    }
+  ]
+}

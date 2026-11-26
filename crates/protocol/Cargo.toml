@@ -1,0 +1,36 @@
+[package]
+name = "cipherdrop-protocol"
+description = "CipherDrop wire protocol v1: envelope types, client-side AES-256-GCM encryption, share URLs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["crypto"]
+# Client-side cryptography. The server depends on this crate with default-features = false
+# so that it never links code that encrypts or decrypts user content.
+crypto = ["dep:aes-gcm", "dep:argon2", "dep:hkdf", "dep:sha2", "dep:zeroize", "dep:secrecy", "dep:getrandom", "dep:unicode-normalization"]
+openapi = ["dep:utoipa"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+aes-gcm = { version = "0.11.1", optional = true, default-features = false, features = ["aes", "alloc", "zeroize"] }
+argon2 = { version = "0.6.0", optional = true, default-features = false, features = ["alloc", "zeroize"] }
+hkdf = { version = "0.13.0", optional = true }
+sha2 = { version = "0.11.2", optional = true }
+zeroize = { version = "1.9.2", optional = true, features = ["derive"] }
+secrecy = { version = "0.10.3", optional = true }
+getrandom = { version = "0.4.3", optional = true }
+utoipa = { version = "6.0.0", optional = true }
+unicode-normalization = { version = "0.1.26", optional = true }
+
+[dev-dependencies]
+hex = "0.4.3"
+proptest = "1.12.0"
