@@ -1,0 +1,21 @@
+# Configuration used by the Playwright end-to-end tests (local, plain HTTP on loopback).
+[server]
+listen = "127.0.0.1:18080"
+public_url = "http://127.0.0.1:18080"
+
+[security]
+require_https = false
+
+[auth]
+anonymous_creation = true
+
+[shares]
+min_ttl_seconds = 60
+
+[rate_limit]
+create_per_minute = 1000
+read_per_minute = 10000
+
+[logging]
+level = "info"
+format = "text"
