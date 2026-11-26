@@ -3,10 +3,13 @@
  * before any request is made; the key never leaves this process.
  */
 
-import { ShareKey, decryptPayload, encryptPayload, type KdfCost } from "./crypto.js";
+import { ShareKey, decryptPayload, decryptWithCek, derivePasswordKeys, encryptPayloadWithAccess, type KdfCost } from "./crypto.js";
+import { b64urlEncode, wipe } from "./encoding.js";
 import {
   ProtocolError,
   decodeEnvelope,
+  decodeKdf,
+  decodePayload,
   encodeEnvelope,
   type ConfigResponse,
   type ConsumeShareResponse,
@@ -126,12 +129,14 @@ export class CipherDrop {
   async create(payload: SecretPayload, opts: CreateOptions = {}): Promise<CreatedShare> {
     const key = ShareKey.generate();
     try {
-      const env = await encryptPayload(key, payload, {
+      const enc = await encryptPayloadWithAccess(key, payload, {
         ...(opts.password !== undefined ? { password: opts.password } : {}),
         ...(opts.kdfCost ? { cost: opts.kdfCost } : {}),
         ...(opts.padTo !== undefined ? { padTo: opts.padTo } : {}),
       });
-      const body: CreateShareRequest = { ...encodeEnvelope(env) };
+      const body: CreateShareRequest = { ...encodeEnvelope(enc.envelope) };
+      // Server-enforced password gate: only SHA-256(access_key) is uploaded.
+      if (enc.accessVerifier) body.access_verifier = enc.accessVerifier;
       if (opts.ttl !== undefined) body.ttl_seconds = opts.ttl;
       if (opts.maxReads !== undefined) body.max_reads = opts.maxReads;
       if (opts.storage) body.storage = opts.storage;
@@ -161,29 +166,58 @@ export class CipherDrop {
   }
 
   /** Raw consume: atomically uses one retrieval and returns the envelope. Never retried. */
-  consume(shareId: string): Promise<ConsumeShareResponse> {
+  consume(shareId: string, accessKey?: string): Promise<ConsumeShareResponse> {
     validateShareId(shareId);
-    return this.call("POST", `/api/v1/shares/${shareId}/consume`, { body: {} });
+    return this.call("POST", `/api/v1/shares/${shareId}/consume`, { body: accessKey ? { access_key: accessKey } : {} });
   }
 
-  /** Consume one retrieval and decrypt locally. Never retried automatically. */
+  /**
+   * Consume one retrieval and decrypt locally. Never retried automatically.
+   * For password-protected shares the password is verified by the server
+   * (via the derived access key) before anything is consumed.
+   */
   async read(link: string, password?: string): Promise<SecretPayload & { remainingReads: number | null }> {
     const l = parseShareLink(link);
     try {
-      if (password === undefined && (await this.status(l.shareId)).password_protected) {
-        // Fail before consuming: a retrieval must not be burned without the password.
-        throw new ProtocolError("password_required");
+      const st = await this.status(l.shareId);
+      if (st.password_protected && password === undefined) throw new ProtocolError("password_required");
+      if (!st.password_protected && password !== undefined) throw new ProtocolError("password_not_expected");
+      let accessKey: string | undefined;
+      let cek: Uint8Array | undefined;
+      let kdfSalt: string | undefined;
+      if (password !== undefined) {
+        if (!st.kdf) throw new ProtocolError("malformed", "missing kdf parameters");
+        const keys = await derivePasswordKeys(l.key, decodeKdf(st.kdf), password);
+        cek = keys.cek;
+        kdfSalt = st.kdf.salt;
+        if (st.access_protected) accessKey = b64urlEncode(keys.accessKey);
+        wipe(keys.accessKey);
       }
-      const r = await this.consume(l.shareId);
-      const env = decodeEnvelope({
-        version: r.version,
-        algorithm: r.algorithm,
-        nonce: r.nonce,
-        ciphertext: r.ciphertext,
-        ...(r.kdf ? { kdf: r.kdf } : {}),
-      });
-      const p = await decryptPayload(l.key, env, password);
-      return { ...p, remainingReads: r.remaining_reads };
+      try {
+        const r = await this.consume(l.shareId, accessKey);
+        const env = decodeEnvelope({
+          version: r.version,
+          algorithm: r.algorithm,
+          nonce: r.nonce,
+          ciphertext: r.ciphertext,
+          ...(r.kdf ? { kdf: r.kdf } : {}),
+        });
+        let p: SecretPayload;
+        if (cek) {
+          if (r.kdf?.salt !== kdfSalt) throw new ProtocolError("decryption");
+          const bytes = await decryptWithCek(cek, env);
+          try {
+            p = decodePayload(bytes);
+          } finally {
+            wipe(bytes);
+          }
+        } else {
+          p = await decryptPayload(l.key, env);
+        }
+        return { ...p, remainingReads: r.remaining_reads };
+      } finally {
+        wipe(cek);
+      }
     } finally {
       l.key.wipe();
     }

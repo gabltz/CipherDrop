@@ -15,6 +15,7 @@ export const SHARE_ID_LEN = 16;
 export const REVOCATION_TOKEN_LEN = 32;
 export const KDF_SALT_LEN = 16;
 export const HKDF_INFO_PASSWORD = "cipherdrop/v1/cek/password";
+export const HKDF_INFO_ACCESS = "cipherdrop/v1/access";
 export const AAD_PREFIX = "cipherdrop/v1;alg=AES-256-GCM;kdf=";
 
 export const KDF_BOUNDS = {
@@ -64,6 +65,12 @@ export interface CreateShareRequest extends EncryptedEnvelope {
   ttl_seconds?: number | null;
   max_reads?: number | null;
   storage?: StorageBackend;
+  /** base64url(SHA-256(access_key)): the server enforces the password before release. */
+  access_verifier?: string;
+}
+
+export interface ConsumeShareRequest {
+  access_key?: string;
 }
 
 export interface CreateShareResponse {
@@ -87,6 +94,8 @@ export interface ShareStatusResponse {
   expires_at: string | null;
   remaining_reads: number | null;
   password_protected: boolean;
+  access_protected: boolean;
+  kdf?: KdfParams;
   storage: StorageBackend;
 }
 
@@ -103,6 +112,7 @@ export interface ConfigResponse {
   persistent_enabled: boolean;
   anonymous_creation: boolean;
   anonymous_retrieval: boolean;
+  max_access_failures: number;
   kdf: Record<string, number>;
 }
 
@@ -152,6 +162,23 @@ export function checkKdfBounds(k: { memoryKib: number; iterations: number; paral
     throw new ProtocolError("kdf_bounds", "parallelism out of bounds");
 }
 
+/** Strictly validate and decode public Argon2id parameters (envelope or status). */
+export function decodeKdf(k: KdfParams): DecodedKdf {
+  if (typeof k !== "object" || k === null) throw new ProtocolError("malformed", "invalid kdf");
+  const keys = Object.keys(k).sort().join(",");
+  if (keys !== "algorithm,iterations,memory_kib,parallelism,salt" || k.algorithm !== "argon2id")
+    throw new ProtocolError("malformed", "invalid kdf");
+  let salt: Uint8Array;
+  try {
+    salt = b64urlDecodeExact(k.salt, KDF_SALT_LEN, "kdf.salt");
+  } catch {
+    throw new ProtocolError("malformed", "invalid kdf salt");
+  }
+  const kdf = { salt, memoryKib: k.memory_kib, iterations: k.iterations, parallelism: k.parallelism };
+  checkKdfBounds(kdf);
+  return kdf;
+}
+
 /** Strictly validate and decode a wire envelope. */
 export function decodeEnvelope(env: EncryptedEnvelope, maxCiphertextLen = Number.MAX_SAFE_INTEGER): DecodedEnvelope {
   if (typeof env !== "object" || env === null) throw new ProtocolError("malformed");
@@ -171,21 +198,7 @@ export function decodeEnvelope(env: EncryptedEnvelope, maxCiphertextLen = Number
     throw new ProtocolError("malformed", (e as Error).message);
   }
   if (ciphertext.length < TAG_LEN) throw new ProtocolError("malformed", "ciphertext too short");
-  let kdf: DecodedKdf | undefined;
-  if (env.kdf !== undefined) {
-    const k = env.kdf;
-    const keys = Object.keys(k).sort().join(",");
-    if (keys !== "algorithm,iterations,memory_kib,parallelism,salt" || k.algorithm !== "argon2id")
-      throw new ProtocolError("malformed", "invalid kdf");
-    let salt: Uint8Array;
-    try {
-      salt = b64urlDecodeExact(k.salt, KDF_SALT_LEN, "kdf.salt");
-    } catch {
-      throw new ProtocolError("malformed", "invalid kdf salt");
-    }
-    kdf = { salt, memoryKib: k.memory_kib, iterations: k.iterations, parallelism: k.parallelism };
-    checkKdfBounds(kdf);
-  }
+  const kdf = env.kdf !== undefined ? decodeKdf(env.kdf) : undefined;
   return { nonce, ciphertext, ...(kdf ? { kdf } : {}) };
 }
 

@@ -12,11 +12,13 @@ from .protocol import (
     ApiError,
     CipherDropError,
     DecryptionError,
+    access_verifier,
     b64d,
     b64e,
     build_aad,
     decrypt,
     derive_cek,
+    derive_password_keys,
     encode_payload,
     encrypt,
     parse_revocation_link,
@@ -26,6 +28,6 @@ from .protocol import (
 
 __version__ = "0.1.0"
 __all__ = [
-    "ApiError", "CipherDrop", "CipherDropError", "DecryptionError", "b64d", "b64e", "build_aad",
+    "ApiError", "CipherDrop", "access_verifier", "derive_password_keys", "CipherDropError", "DecryptionError", "b64d", "b64e", "build_aad",
     "decrypt", "derive_cek", "encode_payload", "encrypt", "parse_revocation_link", "parse_share_link", "validate_envelope",
 ]

@@ -11,7 +11,9 @@ import {
   decodeEnvelope,
   decrypt,
   decryptPayload,
+  accessVerifier,
   deriveContentKey,
+  derivePasswordKeys,
   encodeEnvelope,
   encrypt,
   encryptDeterministic,
@@ -36,6 +38,11 @@ describe("cross-language test vectors", () => {
       expect(buildAadString(env.kdf)).toBe(v.aad);
       const cek = await deriveContentKey(key, env.kdf, v.password ?? undefined);
       expect(hex(cek)).toBe(v.cek_hex);
+      if (v.password) {
+        const keys = await derivePasswordKeys(key, env.kdf!, v.password);
+        expect(hex(keys.accessKey)).toBe(v.access_key_hex);
+        expect(await accessVerifier(keys.accessKey)).toBe(v.access_verifier);
+      }
       const pt = await decrypt(key, env, v.password ?? undefined);
       expect(new TextDecoder().decode(pt)).toBe(v.plaintext);
       const again = await encryptDeterministic(
