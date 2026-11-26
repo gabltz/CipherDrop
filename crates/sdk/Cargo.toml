@@ -10,7 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-cipherdrop-protocol = { path = "../protocol" }
+cipherdrop-protocol = { path = "../protocol", version = "0.1.0" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "http2", "rustls-no-provider", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,5 +22,5 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-cipherdrop-server = { path = "../server", default-features = false, features = ["sqlite"] }
+cipherdrop-server = { path = "../server", version = "0.1.0", default-features = false, features = ["sqlite"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }

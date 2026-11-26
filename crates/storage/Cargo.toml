@@ -14,7 +14,7 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
-cipherdrop-protocol = { path = "../protocol", default-features = false }
+cipherdrop-protocol = { path = "../protocol", version = "0.1.0", default-features = false }
 parking_lot = "0.13"
 subtle = "2.6"
 sha2 = "0.11"
