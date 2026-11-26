@@ -86,7 +86,20 @@ async fn sdk_roundtrip() {
         .unwrap();
     let url = share.url.expose_secret().to_owned();
     assert!(client.read(&url, None).await.is_err());
-    assert!(client.read(&url, Some("wrong")).await.is_err());
+    let err = client.read(&url, Some("wrong")).await.unwrap_err();
+    assert_eq!(
+        err.api_code(),
+        Some("access_denied"),
+        "server rejects wrong password"
+    );
+    let id = ShareLink::parse(&url).unwrap().share_id;
+    let st = client.status(&id).await.unwrap();
+    assert!(st.access_protected);
+    assert_eq!(
+        st.remaining_reads,
+        Some(3),
+        "wrong password consumed nothing"
+    );
     assert_eq!(
         client
             .read(&url, Some("synthetic passphrase"))

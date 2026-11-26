@@ -26,6 +26,10 @@ use crate::state::AppState;
 pub const API_CSP: &str =
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
+/// CSP for the Swagger UI explorer page (no WebAssembly needed there).
+pub const EXPLORER_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 /// CSP for the single-page application.
 ///
 /// `'wasm-unsafe-eval'` is required to instantiate the bundled Argon2id
@@ -78,6 +82,27 @@ pub async fn edge(State(state): State<AppState>, mut req: Request, next: Next) -
     );
     req.extensions_mut().insert(client);
 
+    // Per-client in-flight cap: one client cannot hold every global slot
+    // (e.g. with deliberately slow uploads).
+    let ip_key = crate::net::rate_key(client.ip, state.config.rate_limit.ipv6_prefix_len);
+    {
+        let mut m = state.inflight_per_ip.lock();
+        let n = m.entry(ip_key).or_insert(0);
+        if *n >= state.config.server.max_concurrent_requests_per_ip {
+            drop(m);
+            drop(permit);
+            Metrics::inc(&state.metrics.rate_limited);
+            let mut r = ApiError::RateLimited {
+                retry_after_secs: 1,
+            }
+            .into_response();
+            apply_security_headers(&state, r.headers_mut());
+            return r;
+        }
+        *n += 1;
+    }
+    let inflight = InflightGuard(&state, ip_key);
+
     let method = req.method().clone();
     let route = req
         .extensions()
@@ -108,6 +133,7 @@ pub async fn edge(State(state): State<AppState>, mut req: Request, next: Next) -
             }
         }
     };
+    drop(inflight);
     drop(permit);
 
     apply_security_headers(&state, res.headers_mut());
@@ -120,6 +146,20 @@ pub async fn edge(State(state): State<AppState>, mut req: Request, next: Next) -
         tracing::info!(%method, route, status, latency_ms, "request");
     }
     res
+}
+
+struct InflightGuard<'a>(&'a AppState, std::net::IpAddr);
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut m = self.0.inflight_per_ip.lock();
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
 }
 
 fn apply_security_headers(state: &AppState, h: &mut HeaderMap) {

@@ -36,6 +36,15 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     /// Maximum requests processed concurrently; excess requests get `503`.
     pub max_concurrent_requests: usize,
+    /// Maximum requests processed concurrently for one client IP (`429` beyond).
+    pub max_concurrent_requests_per_ip: usize,
+    /// Maximum open TCP connections (new connections are refused beyond).
+    pub max_connections: usize,
+    /// Maximum open TCP connections per peer IP (trusted proxies are exempt).
+    pub max_connections_per_ip: usize,
+    /// Time allowed to receive complete request headers, including while an
+    /// idle keep-alive connection waits for its next request.
+    pub header_read_timeout_seconds: u64,
     pub shutdown_grace_seconds: u64,
 }
 
@@ -46,6 +55,10 @@ impl Default for ServerConfig {
             public_url: String::new(),
             tls: None,
             max_concurrent_requests: 256,
+            max_concurrent_requests_per_ip: 32,
+            max_connections: 4096,
+            max_connections_per_ip: 64,
+            header_read_timeout_seconds: 10,
             shutdown_grace_seconds: 10,
         }
     }
@@ -113,6 +126,8 @@ pub struct SharesConfig {
     pub allow_permanent: bool,
     /// Allow `max_reads: null` (unlimited retrievals until expiry).
     pub allow_unlimited_reads: bool,
+    /// Wrong access-password attempts after which a share is destroyed.
+    pub max_access_failures: u32,
 }
 
 impl Default for SharesConfig {
@@ -126,6 +141,7 @@ impl Default for SharesConfig {
             max_reads: 100,
             allow_permanent: false,
             allow_unlimited_reads: false,
+            max_access_failures: 10,
         }
     }
 }
@@ -399,6 +415,27 @@ impl Config {
                 "server.max_concurrent_requests must be within 1..=100000",
             ));
         }
+        let srv = &self.server;
+        if srv.max_concurrent_requests_per_ip == 0
+            || srv.max_concurrent_requests_per_ip > srv.max_concurrent_requests
+        {
+            return Err(invalid(
+                "server.max_concurrent_requests_per_ip must be within 1..=max_concurrent_requests",
+            ));
+        }
+        if srv.max_connections == 0
+            || srv.max_connections_per_ip == 0
+            || srv.max_connections_per_ip > srv.max_connections
+        {
+            return Err(invalid(
+                "require 1 <= server.max_connections_per_ip <= server.max_connections",
+            ));
+        }
+        if !(1..=120).contains(&srv.header_read_timeout_seconds) {
+            return Err(invalid(
+                "server.header_read_timeout_seconds must be within 1..=120",
+            ));
+        }
 
         // --- storage ---
         let st = &self.storage;
@@ -447,6 +484,11 @@ impl Config {
         {
             return Err(invalid(
                 "require 1 <= min_ttl_seconds <= default_ttl_seconds <= max_ttl_seconds <= 366 days",
+            ));
+        }
+        if !(1..=1000).contains(&sh.max_access_failures) {
+            return Err(invalid(
+                "shares.max_access_failures must be within 1..=1000",
             ));
         }
         if !(sh.default_max_reads >= 1

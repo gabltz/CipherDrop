@@ -30,7 +30,8 @@ use cipherdrop_protocol::url::ShareId;
 use parking_lot::Mutex;
 
 use crate::{
-    Consumed, NewShare, RevokeAuth, ShareMeta, Status, StoreError, StoredEnvelope, Verifier,
+    AccessCheck, Consumed, NewShare, RevokeAuth, ShareMeta, Status, StoreError, StoredEnvelope,
+    Verifier,
 };
 
 const SHARDS: usize = 64;
@@ -59,6 +60,8 @@ struct Entry {
     envelope: Arc<StoredEnvelope>,
     meta: ShareMeta,
     revocation: Verifier,
+    access: Option<Verifier>,
+    access_failures: u32,
     cost: usize,
 }
 
@@ -159,6 +162,8 @@ impl MemoryStore {
                     envelope: Arc::new(share.envelope),
                     meta: share.meta,
                     revocation: share.revocation,
+                    access: share.access,
+                    access_failures: 0,
                     cost,
                 },
             );
@@ -173,7 +178,12 @@ impl MemoryStore {
     ///
     /// # Errors
     /// [`StoreError::Unavailable`] if the share is unknown, expired, exhausted or revoked.
-    pub fn consume(&self, id: &ShareId, now: u64) -> Result<Consumed, StoreError> {
+    pub fn consume(
+        &self,
+        id: &ShareId,
+        now: u64,
+        access: AccessCheck<'_>,
+    ) -> Result<Consumed, StoreError> {
         let mut shard = self.shard(id).lock();
         let entry = shard.get_mut(id).ok_or(StoreError::Unavailable)?;
         if entry.meta.expires_at.is_some_and(|e| e <= now) {
@@ -183,6 +193,22 @@ impl MemoryStore {
                 self.release(e.cost);
             }
             return Err(StoreError::Unavailable);
+        }
+        // Server-enforced password gate, checked in the same critical section.
+        if let Some(v) = entry.access {
+            let ok = access.key.is_some_and(|k| v.verify(k));
+            if !ok {
+                entry.access_failures = entry.access_failures.saturating_add(1);
+                if access.max_failures > 0 && entry.access_failures >= access.max_failures {
+                    let removed = shard.remove(id);
+                    drop(shard);
+                    if let Some(e) = removed {
+                        self.release(e.cost);
+                    }
+                    return Err(StoreError::AccessDenied { destroyed: true });
+                }
+                return Err(StoreError::AccessDenied { destroyed: false });
+            }
         }
         match entry.meta.remaining_reads {
             None => Ok(Consumed {
@@ -225,6 +251,8 @@ impl MemoryStore {
             expires_at: e.meta.expires_at,
             remaining_reads: e.meta.remaining_reads,
             password_protected: e.envelope.kdf.is_some(),
+            access_protected: e.access.is_some(),
+            kdf: e.envelope.kdf,
         })
     }
 
@@ -340,6 +368,7 @@ mod tests {
                 remaining_reads: reads,
             },
             revocation: Verifier::from_secret(b"revocation-secret"),
+            access: None,
         }
     }
 
@@ -354,10 +383,13 @@ mod tests {
     fn one_time_share_is_consumed_exactly_once() {
         let s = store();
         s.insert(id(1), share(32, Some(100), Some(1)), 0).unwrap();
-        let c = s.consume(&id(1), 1).unwrap();
+        let c = s.consume(&id(1), 1, AccessCheck::none()).unwrap();
         assert_eq!(c.remaining_reads, Some(0));
         assert_eq!(c.envelope.ciphertext.len(), 32);
-        assert_eq!(s.consume(&id(1), 1).unwrap_err(), StoreError::Unavailable);
+        assert_eq!(
+            s.consume(&id(1), 1, AccessCheck::none()).unwrap_err(),
+            StoreError::Unavailable
+        );
         assert_eq!(s.usage().shares, 0);
         assert_eq!(s.usage().bytes, 0);
     }
@@ -366,11 +398,26 @@ mod tests {
     fn limited_reads_count_down() {
         let s = store();
         s.insert(id(1), share(8, None, Some(3)), 0).unwrap();
-        assert_eq!(s.consume(&id(1), 0).unwrap().remaining_reads, Some(2));
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none())
+                .unwrap()
+                .remaining_reads,
+            Some(2)
+        );
         assert_eq!(s.status(&id(1), 0).unwrap().remaining_reads, Some(2));
-        assert_eq!(s.consume(&id(1), 0).unwrap().remaining_reads, Some(1));
-        assert_eq!(s.consume(&id(1), 0).unwrap().remaining_reads, Some(0));
-        assert!(s.consume(&id(1), 0).is_err());
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none())
+                .unwrap()
+                .remaining_reads,
+            Some(1)
+        );
+        assert_eq!(
+            s.consume(&id(1), 0, AccessCheck::none())
+                .unwrap()
+                .remaining_reads,
+            Some(0)
+        );
+        assert!(s.consume(&id(1), 0, AccessCheck::none()).is_err());
         assert!(s.status(&id(1), 0).is_none());
     }
 
@@ -379,7 +426,12 @@ mod tests {
         let s = store();
         s.insert(id(1), share(8, Some(10), None), 0).unwrap();
         for _ in 0..50 {
-            assert_eq!(s.consume(&id(1), 5).unwrap().remaining_reads, None);
+            assert_eq!(
+                s.consume(&id(1), 5, AccessCheck::none())
+                    .unwrap()
+                    .remaining_reads,
+                None
+            );
         }
     }
 
@@ -390,13 +442,16 @@ mod tests {
         s.insert(id(2), share(8, Some(20), Some(5)), 0).unwrap();
         assert!(s.status(&id(1), 9).is_some());
         assert!(s.status(&id(1), 10).is_none());
-        assert_eq!(s.consume(&id(1), 10).unwrap_err(), StoreError::Unavailable);
+        assert_eq!(
+            s.consume(&id(1), 10, AccessCheck::none()).unwrap_err(),
+            StoreError::Unavailable
+        );
         assert_eq!(s.usage().shares, 1, "expired entry removed on access");
         assert_eq!(s.purge_expired(19), 0);
         assert_eq!(s.purge_expired(20), 1);
         assert_eq!(s.usage(), Usage::default());
         // Never resurrected.
-        assert!(s.consume(&id(2), 0).is_err());
+        assert!(s.consume(&id(2), 0, AccessCheck::none()).is_err());
     }
 
     #[test]
@@ -410,7 +465,7 @@ mod tests {
         assert!(s.status(&id(1), 1).is_some());
         s.revoke(&id(1), RevokeAuth::Token(b"revocation-secret"), 1)
             .unwrap();
-        assert!(s.consume(&id(1), 1).is_err());
+        assert!(s.consume(&id(1), 1, AccessCheck::none()).is_err());
         assert_eq!(
             s.revoke(&id(1), RevokeAuth::Admin, 1),
             Err(StoreError::Unavailable)
@@ -436,7 +491,7 @@ mod tests {
             assert!(s.status(&id(i), 0).is_some());
         }
         // Freed capacity is reusable.
-        s.consume(&id(0), 0).unwrap();
+        s.consume(&id(0), 0, AccessCheck::none()).unwrap();
         s.insert(id(99), share(100, Some(1000), Some(1)), 0)
             .unwrap();
     }
@@ -467,11 +522,55 @@ mod tests {
         for i in 0..5000u16 {
             s.insert(id(i), share(1, Some(1_000_000), Some(1)), 0)
                 .unwrap();
-            s.consume(&id(i), 0).unwrap();
+            s.consume(&id(i), 0, AccessCheck::none()).unwrap();
         }
         assert_eq!(s.usage().heap_entries, 5000);
         s.purge_expired(1);
         assert!(s.usage().heap_entries <= 1024);
+    }
+
+    #[test]
+    fn access_gate_blocks_and_destroys_after_failures() {
+        let s = store();
+        let mut sh = share(8, None, Some(2));
+        sh.access = Some(Verifier::from_secret(b"access-key"));
+        s.insert(id(1), sh, 0).unwrap();
+        let wrong = AccessCheck {
+            key: Some(b"nope"),
+            max_failures: 3,
+        };
+        let none = AccessCheck {
+            key: None,
+            max_failures: 3,
+        };
+        let right = AccessCheck {
+            key: Some(b"access-key"),
+            max_failures: 3,
+        };
+        assert_eq!(
+            s.consume(&id(1), 0, none).unwrap_err(),
+            StoreError::AccessDenied { destroyed: false }
+        );
+        assert_eq!(
+            s.consume(&id(1), 0, wrong).unwrap_err(),
+            StoreError::AccessDenied { destroyed: false }
+        );
+        assert_eq!(
+            s.status(&id(1), 0).unwrap().remaining_reads,
+            Some(2),
+            "failures never consume"
+        );
+        assert!(s.status(&id(1), 0).unwrap().access_protected);
+        assert_eq!(
+            s.consume(&id(1), 0, right).unwrap().remaining_reads,
+            Some(1)
+        );
+        assert_eq!(
+            s.consume(&id(1), 0, wrong).unwrap_err(),
+            StoreError::AccessDenied { destroyed: true }
+        );
+        assert!(s.status(&id(1), 0).is_none());
+        assert_eq!(s.usage().shares, 0);
     }
 
     #[test]
@@ -487,7 +586,7 @@ mod tests {
                     let b = Arc::clone(&barrier);
                     std::thread::spawn(move || {
                         b.wait();
-                        s.consume(&id(round), 1).is_ok()
+                        s.consume(&id(round), 1, AccessCheck::none()).is_ok()
                     })
                 })
                 .collect();
@@ -511,7 +610,9 @@ mod tests {
                 let b = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     b.wait();
-                    s.consume(&id(7), 0).ok().map(|c| c.remaining_reads)
+                    s.consume(&id(7), 0, AccessCheck::none())
+                        .ok()
+                        .map(|c| c.remaining_reads)
                 })
             })
             .collect();
@@ -537,7 +638,7 @@ mod tests {
             let (s1, b1) = (Arc::clone(&s), Arc::clone(&b));
             let t1 = std::thread::spawn(move || {
                 b1.wait();
-                s1.consume(&id(round), 0).is_ok()
+                s1.consume(&id(round), 0, AccessCheck::none()).is_ok()
             });
             let (s2, b2) = (Arc::clone(&s), Arc::clone(&b));
             let t2 = std::thread::spawn(move || {

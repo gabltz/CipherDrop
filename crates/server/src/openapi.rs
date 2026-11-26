@@ -46,7 +46,7 @@ use crate::routes::{admin, meta, shares};
         cipherdrop_protocol::KdfParams,
         cipherdrop_protocol::Algorithm,
         cipherdrop_protocol::KdfAlgorithm,
-        shares::ConsumeRequest,
+        cipherdrop_protocol::api::ConsumeShareRequest,
     )),
     tags(
         (name = "shares", description = "Create, retrieve, inspect and revoke encrypted shares"),

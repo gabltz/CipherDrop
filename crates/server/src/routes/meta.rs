@@ -32,6 +32,7 @@ pub async fn get_config(State(state): State<AppState>) -> Json<ConfigResponse> {
         persistent_enabled: c.storage.persistent_enabled,
         anonymous_creation: c.auth.anonymous_creation,
         anonymous_retrieval: c.auth.anonymous_retrieval,
+        max_access_failures: c.shares.max_access_failures,
         kdf: KdfLimits::default(),
     })
 }

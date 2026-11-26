@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cipherdrop_protocol::url::ShareId;
 use cipherdrop_storage::memory::{MemoryLimits, MemoryStore};
-use cipherdrop_storage::{NewShare, ShareMeta, StoredEnvelope, Verifier};
+use cipherdrop_storage::{AccessCheck, NewShare, ShareMeta, StoredEnvelope, Verifier};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 static CTR: AtomicU64 = AtomicU64::new(1);
@@ -34,6 +34,7 @@ fn share(len: usize, exp: Option<u64>, reads: Option<u32>) -> NewShare {
             remaining_reads: reads,
         },
         revocation: Verifier([0; 32]),
+        access: None,
     }
 }
 
@@ -62,7 +63,7 @@ fn benches(c: &mut Criterion) {
                 || (next_id(), share(len, Some(u64::MAX), Some(1))),
                 |(id, s)| {
                     store.insert(id, s, 0).unwrap();
-                    black_box(store.consume(&id, 0).unwrap());
+                    black_box(store.consume(&id, 0, AccessCheck::none()).unwrap());
                 },
                 BatchSize::SmallInput,
             );
@@ -71,7 +72,7 @@ fn benches(c: &mut Criterion) {
         let id = next_id();
         store.insert(id, share(len, None, None), 0).unwrap();
         g.bench_function("consume_unlimited", |b| {
-            b.iter(|| black_box(store.consume(&id, 0).unwrap()))
+            b.iter(|| black_box(store.consume(&id, 0, AccessCheck::none()).unwrap()))
         });
         g.bench_function("status", |b| b.iter(|| black_box(store.status(&id, 0))));
         g.finish();

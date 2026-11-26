@@ -7,7 +7,9 @@
 //! All inputs are fixed synthetic values, so the output is deterministic.
 
 use cipherdrop_protocol::aad::build_aad;
-use cipherdrop_protocol::crypto::{ShareKey, derive_content_key, encrypt_deterministic};
+use cipherdrop_protocol::crypto::{
+    ShareKey, access_verifier, derive_content_key, derive_password_keys, encrypt_deterministic,
+};
 use cipherdrop_protocol::encoding::b64_encode;
 use cipherdrop_protocol::envelope::DecodedKdf;
 use cipherdrop_protocol::payload::SecretPayload;
@@ -95,6 +97,16 @@ fn main() {
         let cek =
             derive_content_key(&key, env.kdf.as_ref(), c.password.map(|(p, _)| p)).expect("cek");
         let wire = serde_json::to_value(env.to_wire()).expect("json");
+        let (access_key_hex, verifier) = match (c.password, env.kdf.as_ref()) {
+            (Some((pw, _)), Some(k)) => {
+                let keys = derive_password_keys(&key, k, pw).expect("keys");
+                (
+                    Some(hex(keys.access_key.as_ref())),
+                    Some(b64_encode(&access_verifier(&keys.access_key))),
+                )
+            }
+            _ => (None, None),
+        };
         if first_env.is_none() {
             first_env = Some((wire.clone(), c.key));
         }
@@ -109,6 +121,8 @@ fn main() {
             "password": c.password.map(|(p, _)| p),
             "aad": String::from_utf8(build_aad(env.kdf.as_ref())).expect("ascii"),
             "cek_hex": hex(cek.as_ref()),
+            "access_key_hex": access_key_hex,
+            "access_verifier": verifier,
             "plaintext": String::from_utf8(c.plaintext.clone()).expect("utf8"),
             "envelope": wire,
         }));
@@ -151,7 +165,7 @@ fn main() {
 
     let doc = json!({
         "protocol_version": 1,
-        "description": "CipherDrop protocol v1 deterministic test vectors. Synthetic data only. Valid vectors: implementations MUST decrypt `envelope` with `key` (+ `password`) to exactly `plaintext`, and MUST reproduce `envelope.ciphertext` when encrypting `plaintext` with the given key, nonce, password and KDF salt. Invalid vectors: implementations MUST reject them; `malformed` errors are raised while decoding the envelope, `decryption` errors by AES-GCM authentication.",
+        "description": "CipherDrop protocol v1 deterministic test vectors. Synthetic data only. Valid vectors: implementations MUST decrypt `envelope` with `key` (+ `password`) to exactly `plaintext`, and MUST reproduce `envelope.ciphertext` when encrypting `plaintext` with the given key, nonce, password and KDF salt. For password vectors, `access_key_hex` is HKDF-Expand(PRK, \"cipherdrop/v1/access\", 32) and `access_verifier` is base64url(SHA-256(access_key)). Invalid vectors: implementations MUST reject them; `malformed` errors are raised while decoding the envelope, `decryption` errors by AES-GCM authentication.",
         "vectors": vectors,
         "invalid": invalid,
     });

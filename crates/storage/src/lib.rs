@@ -94,6 +94,28 @@ pub struct NewShare {
     pub envelope: StoredEnvelope,
     pub meta: ShareMeta,
     pub revocation: Verifier,
+    /// Server-enforced password gate: `SHA-256(access_key)`.
+    pub access: Option<Verifier>,
+}
+
+/// Access-key policy applied atomically during consumption.
+#[derive(Debug, Clone, Copy)]
+pub struct AccessCheck<'a> {
+    /// Access key presented by the client (raw 32 bytes), if any.
+    pub key: Option<&'a [u8]>,
+    /// Wrong attempts after which the share is destroyed (`0` = never destroy).
+    pub max_failures: u32,
+}
+
+impl AccessCheck<'_> {
+    /// No access key presented, default failure limit.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            key: None,
+            max_failures: 10,
+        }
+    }
 }
 
 /// Result of a successful consume.
@@ -111,6 +133,8 @@ pub struct Status {
     pub expires_at: Option<u64>,
     pub remaining_reads: Option<u32>,
     pub password_protected: bool,
+    pub access_protected: bool,
+    pub kdf: Option<DecodedKdf>,
 }
 
 /// Storage errors. Messages contain no identifiers or content.
@@ -131,6 +155,10 @@ pub enum StoreError {
     /// An identifier collision (astronomically unlikely with 128-bit ids).
     #[error("duplicate identifier")]
     Duplicate,
+    /// Missing or wrong access key. `destroyed` is true when this attempt
+    /// exhausted the failure budget and the share was deleted.
+    #[error("access denied")]
+    AccessDenied { destroyed: bool },
     /// Backend failure (persistent store only).
     #[error("storage backend error")]
     Backend,

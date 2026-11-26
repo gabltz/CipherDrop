@@ -39,6 +39,8 @@ pub struct Inner {
     pub public_origin: String,
     pub cors_origins: HashSet<String>,
     pub concurrency: Arc<Semaphore>,
+    /// In-flight requests per client IP (bounded by `max_concurrent_requests_per_ip`).
+    pub inflight_per_ip: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
     pub openapi_json: String,
 }
 
@@ -121,6 +123,7 @@ impl AppState {
             public_origin,
             cors_origins,
             concurrency,
+            inflight_per_ip: parking_lot::Mutex::new(std::collections::HashMap::new()),
             openapi_json,
         })))
     }

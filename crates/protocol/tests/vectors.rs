@@ -1,7 +1,11 @@
 //! Verifies the committed cross-language test vectors.
 
 use cipherdrop_protocol::aad::build_aad;
-use cipherdrop_protocol::crypto::{ShareKey, decrypt, derive_content_key, encrypt_deterministic};
+use cipherdrop_protocol::crypto::{
+    ShareKey, access_verifier, decrypt, derive_content_key, derive_password_keys,
+    encrypt_deterministic,
+};
+use cipherdrop_protocol::encoding::b64_encode;
 use cipherdrop_protocol::{EncryptedEnvelope, ProtocolError};
 use serde_json::Value;
 
@@ -37,6 +41,21 @@ fn valid_vectors_decrypt_and_reproduce() {
             v["cek_hex"].as_str().unwrap(),
             "{name}: cek"
         );
+        if let (Some(p), Some(k)) = (pw, env.kdf.as_ref()) {
+            let keys = derive_password_keys(&key, k, p).unwrap();
+            assert_eq!(
+                hex::encode(keys.access_key.as_ref()),
+                v["access_key_hex"].as_str().unwrap(),
+                "{name}: access key"
+            );
+            assert_eq!(
+                b64_encode(&access_verifier(&keys.access_key)),
+                v["access_verifier"].as_str().unwrap(),
+                "{name}: verifier"
+            );
+        } else {
+            assert!(v["access_key_hex"].is_null());
+        }
         let pt = decrypt(&key, &env, pw).unwrap();
         assert_eq!(
             pt.as_slice(),

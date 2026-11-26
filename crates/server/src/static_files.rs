@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 use crate::error::ApiError;
-use crate::middleware::HTML_CSP;
+use crate::middleware::{EXPLORER_CSP, HTML_CSP};
 
 #[derive(Embed)]
 #[folder = "$CIPHERDROP_DIST"]
@@ -29,7 +29,7 @@ fn safe_path(p: &str) -> bool {
         && p.bytes().all(|b| b.is_ascii_graphic())
 }
 
-fn html(path: &str) -> Response {
+fn html(path: &str, csp: &'static str) -> Response {
     let Some(file) = Assets::get(path) else {
         return ApiError::NotFound.into_response();
     };
@@ -41,7 +41,7 @@ fn html(path: &str) -> Response {
     );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(HTML_CSP),
+        HeaderValue::from_static(csp),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
@@ -49,12 +49,12 @@ fn html(path: &str) -> Response {
 
 /// The single-page application shell for `/`, `/s/{id}`, `/revoke/{id}` and `/docs/*`.
 pub async fn spa() -> Response {
-    html("index.html")
+    html("index.html", HTML_CSP)
 }
 
 /// Swagger UI page generated from `/api/v1/openapi.json`.
 pub async fn api_explorer() -> Response {
-    html("swagger/index.html")
+    html("swagger/index.html", EXPLORER_CSP)
 }
 
 fn serve_file(path: &str, immutable: bool) -> Response {
