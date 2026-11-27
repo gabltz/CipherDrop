@@ -17,6 +17,7 @@
 #   pause | resume         stop / restart automatic updates
 #   unskip vX.Y.Z          allow a skipped release to be deployed automatically again
 #   set-token              replace the GitHub token (reads it from the terminal or stdin)
+#   firewall apply|remove|status   remote mode: allow the port only from the proxy IPs
 #   down                   stop the service (volumes kept; `restart` starts it again)
 #
 # How a release is deployed:
@@ -52,7 +53,7 @@ SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 log() { printf '%s cipherdropctl: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 die() { log "error: $*"; exit 1; }
-usage() { sed -n '2,22s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+usage() { sed -n '2,23s/^# \{0,1\}//p' "$0" >&2; exit 2; }
 
 [[ $(id -u) -eq 0 || -n ${CIPHERDROP_ALLOW_NONROOT:-} ]] || die "run as root: sudo cipherdropctl $*"
 [[ -f $DIR/.env ]] || die "$DIR/.env not found (run install.sh first)"
@@ -71,6 +72,8 @@ env_get() {
 REPO=$(env_get CIPHERDROP_GITHUB_REPO)
 DOMAIN=$(env_get CIPHERDROP_DOMAIN)
 PORT=$(env_get CIPHERDROP_PORT 8080)
+MODE=$(env_get CIPHERDROP_MODE local)
+BIND=$(env_get CIPHERDROP_BIND_ADDRESS 127.0.0.1)
 
 # ------------------------------------------------------------------- state ---
 
@@ -229,11 +232,19 @@ prepare_release() { # tag run_id commit ; returns 1 transient, 2 bad release
 
 dc() { # tag compose-args...
   local tag=$1; shift
-  local rel=$STATE/releases/$tag files
-  files=(-f "$rel/stack/compose.yml")
-  [[ $(env_get CIPHERDROP_PERSISTENT false) == true ]] && files+=(-f "$rel/stack/compose.persistent.yml")
-  [[ -n $(env_get CIPHERDROP_PROXY_NETWORK) ]] && files+=(-f "$rel/stack/compose.proxy-network.yml")
-  CIPHERDROP_IMAGE=$(<"$rel/image") CIPHERDROP_CONFIG_FILE=$DIR/config.toml \
+  local rel=$STATE/releases/$tag files=()
+  overlay() {
+    [[ -f $rel/stack/$1 ]] || die "release $tag does not support this setup ($1 missing); deploy a newer release"
+    files+=(-f "$rel/stack/$1")
+  }
+  overlay compose.yml
+  case $MODE in
+    caddy) overlay compose.caddy.yml ;;
+    remote) [[ $BIND == 127.0.0.1 || $BIND == 0.0.0.0 ]] || overlay compose.loopback.yml ;;
+  esac
+  [[ $(env_get CIPHERDROP_PERSISTENT false) == true ]] && overlay compose.persistent.yml
+  [[ -n $(env_get CIPHERDROP_PROXY_NETWORK) ]] && overlay compose.proxy-network.yml
+  CIPHERDROP_IMAGE=$(<"$rel/image") CIPHERDROP_CONFIG_FILE=$DIR/config.toml CIPHERDROP_STACK_DIR=$rel/stack \
     docker compose --project-name cipherdrop --project-directory "$DIR" --env-file "$DIR/.env" "${files[@]}" "$@"
 }
 
@@ -261,7 +272,54 @@ local_check() { # tag
   log "no answer on 127.0.0.1:$PORT"; return 1
 }
 
+# ---------------------------------------------------------------- firewall ---
+# Remote mode publishes the port on a network address. Docker bypasses INPUT
+# rules for published ports, so the filter lives in the DOCKER-USER chain:
+# new connections to BIND:PORT are accepted only from CIPHERDROP_PROXY_IPS (and
+# the Docker gateway, which carries the loopback health checks).
+fw_remove() {
+  command -v iptables >/dev/null || return 0
+  local r a
+  while read -r r; do
+    read -r -a a <<<"${r/#-A /-D }"
+    iptables "${a[@]}" 2>/dev/null || true
+  done < <(iptables -S DOCKER-USER 2>/dev/null | grep -- '-j CIPHERDROP$' || true)
+  iptables -F CIPHERDROP 2>/dev/null || true
+  iptables -X CIPHERDROP 2>/dev/null || true
+}
+
+fw_apply() {
+  if [[ $MODE != remote || $(env_get CIPHERDROP_FIREWALL true) != true ]]; then fw_remove; return 0; fi
+  if ! command -v iptables >/dev/null || ! iptables -n -L DOCKER-USER >/dev/null 2>&1; then
+    log "warning: no iptables DOCKER-USER chain: port $PORT is NOT firewalled (use your provider's firewall)"
+    return 0
+  fi
+  local ips ip rule
+  IFS=', ' read -r -a ips <<<"$(env_get CIPHERDROP_PROXY_IPS)"
+  (( ${#ips[@]} )) || die "CIPHERDROP_PROXY_IPS is empty in $DIR/.env (remote mode)"
+  fw_remove
+  iptables -N CIPHERDROP
+  for ip in "${ips[@]}" "$(env_get CIPHERDROP_GATEWAY)"; do
+    [[ -n $ip ]] && iptables -A CIPHERDROP -s "$ip" -j RETURN
+  done
+  iptables -A CIPHERDROP -j DROP
+  rule=(-p tcp -m conntrack --ctdir ORIGINAL --ctorigdstport "$PORT")
+  [[ $BIND == 0.0.0.0 ]] || rule+=(--ctorigdst "$BIND")
+  iptables -I DOCKER-USER "${rule[@]}" -j CIPHERDROP
+}
+
+cmd_firewall() {
+  case ${1:-status} in
+    apply) fw_apply; [[ $MODE == remote ]] && log "firewall: $BIND:$PORT allowed from $(env_get CIPHERDROP_PROXY_IPS) only" || true ;;
+    remove) fw_remove ;;
+    status) iptables -S CIPHERDROP 2>/dev/null || echo "no CipherDrop firewall rules (mode $MODE)"
+            iptables -S DOCKER-USER 2>/dev/null | grep -- '-j CIPHERDROP' || true ;;
+    *) usage ;;
+  esac
+}
+
 activate() { # tag
+  fw_apply
   log "starting $1"
   if ! dc "$1" up -d --remove-orphans --wait --wait-timeout "$WAIT_TIMEOUT" >&2; then
     log "container did not become healthy"
@@ -303,7 +361,8 @@ install_tools() { # tag
     cmp -s "$s/bin/$f" "$LIB/$f" && continue
     install -m 0755 "$s/bin/$f" "$LIB/.$f.new" && mv -f "$LIB/.$f.new" "$LIB/$f"
   done
-  for f in cipherdrop-update.service cipherdrop-update.timer; do
+  for f in cipherdrop-update.service cipherdrop-update.timer cipherdrop-firewall.service; do
+    [[ -f $s/systemd/$f ]] || continue
     cmp -s "$s/systemd/$f" "/etc/systemd/system/$f" && continue
     install -m 0644 "$s/systemd/$f" "/etc/systemd/system/$f"; changed=1
   done
@@ -421,7 +480,11 @@ cmd_rollback() {
 
 cmd_status() {
   local cur; cur=$(state_get current)
-  echo "domain:      https://$DOMAIN  (upstream http://127.0.0.1:$PORT)"
+  case $MODE in
+    caddy) echo "domain:      https://$DOMAIN  (bundled Caddy on ports 80/443)" ;;
+    remote) echo "domain:      https://$DOMAIN  (proxy $(env_get CIPHERDROP_PROXY_IPS) -> http://$BIND:$PORT)" ;;
+    *) echo "domain:      https://$DOMAIN  (local proxy -> http://127.0.0.1:$PORT)" ;;
+  esac
   echo "current:     ${cur:-<none>}"
   echo "previous:    $(state_get previous)"
   if [[ -f $STATE/paused ]]; then echo "auto-update: PAUSED"; else echo "auto-update: $(env_get CIPHERDROP_AUTO_UPDATE true) (channel $(env_get CIPHERDROP_CHANNEL stable))"; fi
@@ -440,6 +503,7 @@ cmd_restart() {
   lock wait
   preflight "$cur"
   ensure_smoke_token "$cur"
+  fw_apply
   dc "$cur" up -d --force-recreate --remove-orphans --wait --wait-timeout "$WAIT_TIMEOUT" >&2
   local_check "$cur"
   journal restart "$cur"; log "restarted $cur"
@@ -493,6 +557,7 @@ main() {
     resume) rm -f "$STATE/paused"; journal resumed "-"; log "automatic updates resumed" ;;
     unskip) [[ -n ${1:-} ]] || usage; skip_remove "$1"; rm -f "$STATE/attempts/$1"; log "$1 may be deployed automatically again" ;;
     set-token) cmd_set_token ;;
+    firewall) cmd_firewall "$@" ;;
     down) c=$(current_or_die); lock wait; dc "$c" down --remove-orphans >&2; journal down "$c" ;;
     *) usage ;;
   esac

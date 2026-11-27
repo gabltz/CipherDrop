@@ -10,10 +10,10 @@ CipherDrop is a single executable (`cipherdrop-server`) with the web interface e
 
 ## Production pipeline
 
-`deploy/production/` in the repository contains a complete production setup for a Linux host behind an existing reverse proxy:
+`deploy/production/` in the repository contains a complete production setup for a Linux host in one of three modes: behind a reverse proxy on the same host, behind a reverse proxy on another server (with the backend port restricted to the proxy's address), or standalone with a bundled Caddy that provides automatic HTTPS. It includes:
 
-- a single `install.sh` that sets up the host
-- a hardened Compose stack listening on loopback for the proxy
+- a single `install.sh` that sets up the host and asks for the mode and port
+- a hardened Compose stack
 - ready-made nginx, Caddy, Apache and Traefik configurations
 - `cipherdropctl` and a systemd timer: the host itself pulls each release built by `.github/workflows/release.yml`, verifies its Sigstore signature, deploys it with health and smoke checks, and rolls back automatically
 

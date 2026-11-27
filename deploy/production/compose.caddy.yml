@@ -1,0 +1,37 @@
+# Overlay for CIPHERDROP_MODE=caddy: no external reverse proxy. The bundled
+# Caddy serves https://<domain> on ports 80/443 with automatic certificates
+# (Let's Encrypt/ZeroSSL), redirects HTTP to HTTPS and discards access logs.
+# CIPHERDROP_CADDY_TLS is the ACME account e-mail, or "internal" for Caddy's
+# own CA (private networks). CIPHERDROP_STACK_DIR is set by cipherdropctl.
+services:
+  caddy:
+    image: caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    pull_policy: missing
+    restart: unless-stopped
+    depends_on:
+      cipherdrop:
+        condition: service_healthy
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 256
+    environment:
+      CIPHERDROP_DOMAIN: "${CIPHERDROP_DOMAIN:?set CIPHERDROP_DOMAIN in .env}"
+      CIPHERDROP_CADDY_TLS: "${CIPHERDROP_CADDY_TLS:?set CIPHERDROP_CADDY_TLS (ACME e-mail or internal) in .env}"
+    ports:
+      - "${CIPHERDROP_HTTP_PORT:-80}:80"
+      - "${CIPHERDROP_HTTPS_PORT:-443}:443"
+      - "${CIPHERDROP_HTTPS_PORT:-443}:443/udp"   # HTTP/3
+    volumes:
+      - ${CIPHERDROP_STACK_DIR:?set by cipherdropctl}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data         # certificates and ACME account (no share data)
+      - caddy_config:/config
+    networks: [internal]
+    logging:
+      driver: local
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddy_data:
+  caddy_config:
