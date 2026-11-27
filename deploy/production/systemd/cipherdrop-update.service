@@ -1,0 +1,18 @@
+[Unit]
+Description=CipherDrop: deploy the newest verified release
+Documentation=file:///var/lib/cipherdrop/src/deploy/production/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cipherdropctl update
+Environment=TUF_ROOT=/var/lib/cipherdrop/sigstore
+TimeoutStartSec=20min
+Nice=10
+UMask=0077
+# Writes: deploy state, stack config (smoke token), docker, tool self-update.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

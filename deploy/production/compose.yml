@@ -1,0 +1,56 @@
+# CipherDrop production stack, behind a reverse proxy on the same host.
+#
+# Driven by cipherdropctl (do not run `docker compose` by hand): it supplies
+# CIPHERDROP_IMAGE (a verified, locally loaded release image) and
+# CIPHERDROP_CONFIG_FILE, and uses a per-release copy of this file so that a
+# rollback also restores the previous stack definition.
+#
+# Settings: /opt/cipherdrop/.env (see env.example) and
+# /opt/cipherdrop/config.toml (see config.toml.example). The environment
+# variables below override the config file.
+
+name: cipherdrop
+
+services:
+  cipherdrop:
+    image: ${CIPHERDROP_IMAGE:?set by cipherdropctl}
+    pull_policy: never            # images come only from verified release artifacts
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CIPHERDROP_MEM_LIMIT:-256m}
+    memswap_limit: ${CIPHERDROP_MEM_LIMIT:-256m}   # equal to mem_limit: never swapped
+    cpus: ${CIPHERDROP_CPUS:-1.0}
+    pids_limit: 128
+    ulimits:
+      core: 0
+    environment:
+      CIPHERDROP__SERVER__LISTEN: "0.0.0.0:8080"
+      CIPHERDROP__SERVER__PUBLIC_URL: "https://${CIPHERDROP_DOMAIN:?set CIPHERDROP_DOMAIN in .env}"
+      # TLS is terminated by the reverse proxy, which must send X-Forwarded-Proto: https.
+      CIPHERDROP__SECURITY__REQUIRE_HTTPS: "true"
+      CIPHERDROP__SECURITY__TRUST_FORWARDED_HEADERS: "true"
+      # The proxy reaches the container through the loopback port below; Docker
+      # forwards it from this network's gateway. install.sh computes the list.
+      CIPHERDROP__SECURITY__TRUSTED_PROXIES: "${CIPHERDROP_TRUSTED_PROXIES:?set by install.sh}"
+      CIPHERDROP__STORAGE__MAX_MEMORY_MB: "${CIPHERDROP_MAX_MEMORY_MB:-128}"
+      CIPHERDROP__LOGGING__LEVEL: "warn"
+      CIPHERDROP__LOGGING__FORMAT: "json"
+    volumes:
+      - ${CIPHERDROP_CONFIG_FILE:?set by cipherdropctl}:/etc/cipherdrop/config.toml:ro
+    command: ["serve", "--config", "/etc/cipherdrop/config.toml"]
+    ports:
+      # Loopback only: reachable by the reverse proxy on this host, not from outside.
+      - "127.0.0.1:${CIPHERDROP_PORT:-8080}:8080"
+    networks: [internal]
+    logging:
+      driver: local
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: ${CIPHERDROP_SUBNET:?set by install.sh}
+          gateway: ${CIPHERDROP_GATEWAY:?set by install.sh}

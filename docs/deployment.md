@@ -8,6 +8,17 @@ CipherDrop is a single executable (`cipherdrop-server`) with the web interface e
 - HTTPS, either native (`[server.tls]`) or through a reverse proxy. Browsers expose the Web Crypto API only in secure contexts.
 - Memory: set `storage.max_memory_mb` below the container memory limit, leaving headroom for in-flight requests (roughly `max_concurrent_requests × 3 × max_size_bytes` in the worst case) and about 20 MiB of process overhead.
 
+## Production pipeline
+
+`deploy/production/` in the repository contains a complete production setup for a Linux host behind an existing reverse proxy:
+
+- a single `install.sh` that sets up the host
+- a hardened Compose stack listening on loopback for the proxy
+- ready-made nginx, Caddy, Apache and Traefik configurations
+- `cipherdropctl` and a systemd timer: the host itself pulls each release built by `.github/workflows/release.yml`, verifies its Sigstore signature, deploys it with health and smoke checks, and rolls back automatically
+
+Its `README.md` is the operator runbook.
+
 ## Docker
 
 The image is built from `Dockerfile` (multi-stage: Node builds the frontend, Rust builds a static musl binary, and the runtime image is `scratch`-based with only the binary and CA certificates). It runs as UID 65532, exposes port 8080, and has a `HEALTHCHECK` using the binary itself.

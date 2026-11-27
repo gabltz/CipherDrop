@@ -56,6 +56,7 @@ share = CipherDrop("https://paste.example.com").create_secret("My secret", ttl=3
 | [SDKs](docs/sdk.md) · [CLI](docs/cli.md) | Clients |
 | [Security](docs/security.md) · [Threat model](THREAT_MODEL.md) | Guarantees and limitations |
 | [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) | Operations |
+| [Production runbook](deploy/production/README.md) | One-script install, automatic releases, rollback, operations |
 | [Architecture](ARCHITECTURE.md) | Design decisions |
 
 The same documentation is served by every instance at `/docs`, with an encrypting API playground and a bundled Swagger UI at `/docs/api/explorer`.

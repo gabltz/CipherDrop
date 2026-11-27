@@ -2,8 +2,10 @@ name: CI
 on:
   push: { branches: [main] }
   pull_request:
+  workflow_call:      # gate for release.yml: nothing is published unless the full suite passes
 permissions: { contents: read }
-concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: true }
+# github.workflow is the caller's name when reused, so a release never shares a group with branch CI.
+concurrency: { group: "ci-${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
 env:
   CARGO_TERM_COLOR: always
 
