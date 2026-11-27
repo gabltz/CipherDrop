@@ -1,0 +1,28 @@
+# Overlay enabling explicitly persistent shares (SQLite, encrypted payloads only).
+# Enabled by CIPHERDROP_PERSISTENT=true in /opt/cipherdrop/.env.
+# Grant `shares:create:persistent` only to administrators' tokens, and back up
+# the cipherdrop_cipherdrop_data volume (see README.md, "Backups").
+services:
+  cipherdrop:
+    depends_on:
+      cipherdrop-init:
+        condition: service_completed_successfully
+    environment:
+      CIPHERDROP__STORAGE__PERSISTENT_ENABLED: "true"
+      CIPHERDROP__STORAGE__SQLITE_PATH: "/data/cipherdrop.sqlite3"
+    volumes:
+      - cipherdrop_data:/data
+
+  # One-shot helper giving the non-root UID ownership of the volume (the release
+  # image has no shell, so a pinned Alpine image does it).
+  cipherdrop-init:
+    image: alpine:3@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+    pull_policy: missing
+    command: ["sh", "-c", "chown 65532:65532 /data && chmod 0700 /data"]
+    volumes:
+      - cipherdrop_data:/data
+    network_mode: none
+    restart: "no"
+
+volumes:
+  cipherdrop_data:

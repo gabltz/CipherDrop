@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# cipherdropctl — keeps CipherDrop on this host up to date, and operates it.
+#
+# Installed by install.sh to /usr/local/bin/cipherdropctl; the
+# cipherdrop-update.timer runs `cipherdropctl update` every few minutes.
+#
+#   update                 deploy the newest successful release if it is newer (timer)
+#   deploy vX.Y.Z          deploy a specific release (also older ones)
+#   rollback               go back to the previous release; skip the current one
+#   status                 releases, auto-update state, container health, version
+#   logs [N]               last N log lines (default 200)
+#   history [N]            deploy journal
+#   check-config           validate .env + config.toml with the running release
+#   restart                validate, recreate the container, health-check
+#   token add NAME [SCOPE...]  create an API token (default scope shares:create)
+#   smoke                  run the external smoke test against https://<domain>
+#   pause | resume         stop / restart automatic updates
+#   unskip vX.Y.Z          allow a skipped release to be deployed automatically again
+#   set-token              replace the GitHub token (reads it from the terminal or stdin)
+#   down                   stop the service (volumes kept; `restart` starts it again)
+#
+# How a release is deployed:
+#   1. the newest run of .github/workflows/release.yml that succeeded for a vX.Y.Z tag
+#   2. deploy/production at that tag is fetched with the read-only deploy key and
+#      its commit must equal the run's commit
+#   3. the run's artifact (per-arch image archive + SHA256SUMS) is downloaded with
+#      the Actions:read token; SHA256SUMS must carry a Sigstore signature made by
+#      release.yml for exactly that tag and commit
+#   4. config check with the new image, start, health check, version check through
+#      the forwarded-header path, then (if the public URL worked before) the public
+#      smoke test. Any failure restores the previous release and skips the new one.
+#
+# NOTE: shares live in RAM. Every deploy, rollback or restart discards all
+# non-persistent shares. That is by design.
+set -euo pipefail
+umask 077
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+
+ETC=${CIPHERDROP_ETC:-/etc/cipherdrop}
+DIR=${CIPHERDROP_DIR:-/opt/cipherdrop}
+STATE=${CIPHERDROP_STATE_DIR:-/var/lib/cipherdrop}
+API=${CIPHERDROP_GITHUB_API:-https://api.github.com}
+LIB=${CIPHERDROP_LIB:-/usr/local/lib/cipherdrop}
+WAIT_TIMEOUT=${CIPHERDROP_WAIT_TIMEOUT:-120}
+export TUF_ROOT=${TUF_ROOT:-$STATE/sigstore}
+WORKFLOW=release.yml
+ARTIFACT=cipherdrop-image
+OIDC_ISSUER=https://token.actions.githubusercontent.com
+MAX_ATTEMPTS=3
+TOKEN_FILE=$ETC/github-token
+SEMVER='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+log() { printf '%s cipherdropctl: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+usage() { sed -n '2,22s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+
+[[ $(id -u) -eq 0 || -n ${CIPHERDROP_ALLOW_NONROOT:-} ]] || die "run as root: sudo cipherdropctl $*"
+[[ -f $DIR/.env ]] || die "$DIR/.env not found (run install.sh first)"
+install -d -m 0700 "$STATE" "$STATE/releases" "$STATE/attempts"
+
+# ---------------------------------------------------------------- settings ---
+
+# KEY=value from .env, without executing it.
+env_get() {
+  local v
+  v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$DIR/.env" | tail -n 1)
+  v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+  printf '%s' "${v:-${2:-}}"
+}
+
+REPO=$(env_get CIPHERDROP_GITHUB_REPO)
+DOMAIN=$(env_get CIPHERDROP_DOMAIN)
+PORT=$(env_get CIPHERDROP_PORT 8080)
+
+# ------------------------------------------------------------------- state ---
+
+state_get() { [[ -f $STATE/$1 ]] && cat "$STATE/$1" || true; }
+state_set() { printf '%s\n' "$2" > "$STATE/$1.tmp" && mv -f "$STATE/$1.tmp" "$STATE/$1"; }
+journal() { printf '%s %-16s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$STATE/history.log"; }
+skipped() { grep -qxF "$1" "$STATE/skip" 2>/dev/null; }
+skip_add() { skipped "$1" || echo "$1" >> "$STATE/skip"; }
+skip_remove() { [[ -f $STATE/skip ]] && { grep -vxF "$1" "$STATE/skip" > "$STATE/skip.tmp" || true; mv -f "$STATE/skip.tmp" "$STATE/skip"; }; return 0; }
+
+lock() { # wait|try
+  exec 9>"$STATE/lock"
+  local rc=0
+  if [[ $1 == try ]]; then flock -n 9 || rc=$?; else flock -w 600 9 || rc=$?; fi
+  case $rc in
+    0) return 0 ;;
+    1) [[ $1 == try ]] && exit 0; die "another cipherdropctl operation is still running" ;;
+    *) die "flock failed (util-linux flock is required)" ;;
+  esac
+}
+
+notify() { # level message
+  local url msg="CipherDrop ($DOMAIN): $2"
+  url=$(env_get CIPHERDROP_NOTIFY_URL)
+  [[ $1 == error ]] && log "$2"
+  [[ -n $url ]] || return 0
+  case $url in
+    https://hooks.slack.com/*) curl -fsS --max-time 15 -H 'Content-Type: application/json' \
+        -d "$(jq -n --arg t "$msg" '{text: $t}')" "$url" >/dev/null ;;
+    https://discord.com/api/webhooks/* | https://discordapp.com/api/webhooks/*) curl -fsS --max-time 15 \
+        -H 'Content-Type: application/json' -d "$(jq -n --arg t "$msg" '{content: $t}')" "$url" >/dev/null ;;
+    *) curl -fsS --max-time 15 -H "Title: CipherDrop $1" -H "Priority: $([[ $1 == error ]] && echo high || echo default)" \
+        -d "$msg" "$url" >/dev/null ;;
+  esac || log "warning: notification to CIPHERDROP_NOTIFY_URL failed"
+}
+
+# sort -V with pre-releases before their release (1.2.0-rc.1 < 1.2.0).
+vkey() { local v=${1#v}; printf '%s' "${v/-/\~}"; }
+version_gt() { # a > b
+  [[ $1 != "$2" ]] || return 1
+  [[ $(printf '%s\n%s\n' "$(vkey "$2")" "$(vkey "$1")" | sort -V | tail -n 1) == "$(vkey "$1")" ]]
+}
+
+# ------------------------------------------------------------------ GitHub ---
+
+gh_api() { # path (relative to /repos/OWNER/NAME)
+  local out code
+  [[ -s $TOKEN_FILE ]] || die "no GitHub token: run 'cipherdropctl set-token'"
+  out=$(mktemp)
+  code=$(curl -sS --max-time 60 --retry 2 -o "$out" -w '%{http_code}' \
+    -H "Authorization: Bearer $(<"$TOKEN_FILE")" -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" "$API/repos/$REPO${1:+/$1}") || code=000
+  case $code in
+    2??) cat "$out"; rm -f "$out" ;;
+    401) rm -f "$out"; notify error "GitHub token rejected (expired or revoked). Run: sudo cipherdropctl set-token"; exit 1 ;;
+    403 | 404) rm -f "$out"; die "GitHub API $code for /repos/$REPO/$1: the token needs Actions: read on $REPO" ;;
+    *) rm -f "$out"; die "GitHub API unavailable (HTTP $code)" ;;
+  esac
+}
+
+# "tag run_id commit" for successful release runs, newest run first, one per tag.
+list_releases() { # channel: stable|prerelease|any
+  gh_api "actions/workflows/$WORKFLOW/runs?event=push&status=success&per_page=100" \
+    | jq -r '.workflow_runs[] | [.head_branch, (.id|tostring), .head_sha] | @tsv' \
+    | while IFS=$'\t' read -r tag id sha; do
+        [[ $tag =~ $SEMVER && $sha =~ ^[0-9a-f]{40}$ ]] || continue
+        [[ $1 == stable && $tag == *-* ]] && continue
+        printf '%s %s %s\n' "$tag" "$id" "$sha"
+      done | awk '!seen[$1]++'
+}
+
+newest() { # reads "tag ..." lines, prints the line with the highest version
+  local best="" line
+  while read -r line; do
+    [[ -z $best ]] || version_gt "${line%% *}" "${best%% *}" && best=$line
+  done
+  [[ -n $best ]] && printf '%s\n' "$best"
+  return 0
+}
+
+git_ssh() {
+  printf 'ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20' \
+    "$ETC/deploy_key" "$ETC/known_hosts"
+}
+
+# deploy/production at <tag> into <dest>; the tag must point at <commit>.
+fetch_stack() { # tag commit dest
+  local src=$STATE/src url got
+  url=$(env_get CIPHERDROP_GIT_URL "git@github.com:$REPO.git")
+  export GIT_SSH_COMMAND; GIT_SSH_COMMAND=$(git_ssh)
+  if [[ ! -d $src/.git ]]; then
+    git init -q "$src"
+    git -C "$src" remote add origin "$url"
+    git -C "$src" sparse-checkout init --cone
+    git -C "$src" sparse-checkout set deploy/production
+  fi
+  git -C "$src" remote set-url origin "$url"
+  git -C "$src" fetch -q --depth 1 --filter=blob:none --force origin "+refs/tags/$1:refs/tags/$1" \
+    || { log "git fetch of $1 failed (deploy key not added, or GitHub unreachable)"; return 1; }
+  got=$(git -C "$src" rev-parse "refs/tags/$1^{commit}")
+  [[ $got == "$2" ]] || { log "tag $1 is commit $got but the release run built $2"; return 2; }
+  git -C "$src" -c advice.detachedHead=false checkout -q --force "refs/tags/$1"
+  rm -rf "$3"; cp -a "$src/deploy/production" "$3"
+}
+
+# Download, verify and load a release into $STATE/releases/<tag>.
+# Called in a `||` context, where set -e is inactive: every step is checked.
+prepare_release() { # tag run_id commit ; returns 1 transient, 2 bad release
+  local tag=$1 run=$2 sha=$3 rel=$STATE/releases/$1 tmp arch url full rc=0 ref
+  [[ -s $rel/image ]] && docker image inspect "$(<"$rel/image")" >/dev/null 2>&1 && return 0
+  arch=$(dpkg --print-architecture 2>/dev/null || uname -m)
+  case $arch in amd64 | x86_64) arch=amd64 ;; arm64 | aarch64) arch=arm64 ;; *) die "unsupported architecture $arch" ;; esac
+  tmp=$(mktemp -d "$STATE/releases/.$tag.XXXXXX") || return 1
+  log "fetching $tag (run $run, commit ${sha:0:12})"
+
+  fetch_stack "$tag" "$sha" "$tmp/stack" || { rc=$?; rm -rf "$tmp"; return "$rc"; }
+
+  url=$(gh_api "actions/runs/$run/artifacts?name=$ARTIFACT" \
+    | jq -r '[.artifacts[] | select(.expired == false)][0].archive_download_url // empty') \
+    || { rm -rf "$tmp"; return 1; }
+  [[ -n $url ]] || { log "release $tag has no unexpired '$ARTIFACT' artifact (artifacts expire after 90 days)"; rm -rf "$tmp"; return 2; }
+  curl -fsSL --max-time 600 --retry 2 -H "Authorization: Bearer $(<"$TOKEN_FILE")" -o "$tmp/artifact.zip" "$url" \
+    || { log "artifact download failed"; rm -rf "$tmp"; return 1; }
+  unzip -q -o "$tmp/artifact.zip" -d "$tmp/artifact" || { log "corrupt artifact download"; rm -rf "$tmp"; return 1; }
+  rm -f "$tmp/artifact.zip"
+
+  full=$(gh_api "" | jq -r .full_name) && [[ $full == */* ]] || { rm -rf "$tmp"; return 1; }
+  if ! cosign verify-blob "$tmp/artifact/SHA256SUMS" \
+      --bundle "$tmp/artifact/SHA256SUMS.sigstore.json" \
+      --certificate-oidc-issuer "$OIDC_ISSUER" \
+      --certificate-identity "https://github.com/$full/.github/workflows/$WORKFLOW@refs/tags/$tag" \
+      --certificate-github-workflow-sha "$sha" >"$tmp/cosign.log" 2>&1; then
+    sed 's/^/  cosign: /' "$tmp/cosign.log" >&2
+    log "signature verification FAILED for $tag"; rm -rf "$tmp"; return 2
+  fi
+  local want=("release.json" "cipherdrop-$tag-linux-$arch.tar")
+  for f in "${want[@]}"; do
+    grep -qE "^[0-9a-f]{64}  $f\$" "$tmp/artifact/SHA256SUMS" || { log "SHA256SUMS does not list $f"; rm -rf "$tmp"; return 2; }
+  done
+  (cd "$tmp/artifact" && grep -E "  (release\.json|cipherdrop-$tag-linux-$arch\.tar)\$" SHA256SUMS | sha256sum --check --strict --quiet -) \
+    || { log "checksum mismatch in $tag artifact"; rm -rf "$tmp"; return 2; }
+  [[ $(jq -r .version "$tmp/artifact/release.json") == "$tag" && $(jq -r .commit "$tmp/artifact/release.json") == "$sha" ]] \
+    || { log "release.json does not match $tag/$sha"; rm -rf "$tmp"; return 2; }
+  log "signature and checksums verified"
+
+  ref=$(docker load -i "$tmp/artifact/cipherdrop-$tag-linux-$arch.tar" | sed -n 's/^Loaded image: //p' | tail -n 1) \
+    || { log "docker load failed"; rm -rf "$tmp"; return 1; }
+  [[ $ref == *":$tag" ]] || { log "unexpected image in archive: '$ref'"; rm -rf "$tmp"; return 2; }
+  if ! { printf '%s\n' "$ref" > "$tmp/image" && cp "$tmp/artifact/release.json" "$tmp/release.json" \
+      && rm -rf "$tmp/artifact" "$rel" && mv "$tmp" "$rel"; }; then
+    rm -rf "$tmp"; return 1
+  fi
+}
+
+# ----------------------------------------------------------------- compose ---
+
+dc() { # tag compose-args...
+  local tag=$1; shift
+  local rel=$STATE/releases/$tag files
+  files=(-f "$rel/stack/compose.yml")
+  [[ $(env_get CIPHERDROP_PERSISTENT false) == true ]] && files+=(-f "$rel/stack/compose.persistent.yml")
+  [[ -n $(env_get CIPHERDROP_PROXY_NETWORK) ]] && files+=(-f "$rel/stack/compose.proxy-network.yml")
+  CIPHERDROP_IMAGE=$(<"$rel/image") CIPHERDROP_CONFIG_FILE=$DIR/config.toml \
+    docker compose --project-name cipherdrop --project-directory "$DIR" --env-file "$DIR/.env" "${files[@]}" "$@"
+}
+
+image_of() { cat "$STATE/releases/$1/image"; }
+
+preflight() {
+  dc "$1" run --rm --no-deps -T cipherdrop --config /etc/cipherdrop/config.toml check-config >&2
+}
+
+# Version over the forwarded-header path: proves the new release runs and that
+# the proxy trust settings work (require_https would reject the request otherwise).
+local_check() { # tag
+  local deadline=$((SECONDS + 60)) body="" code
+  while (( SECONDS < deadline )); do
+    code=$(curl -sS --max-time 5 -o "$STATE/.version" -w '%{http_code}' -H 'X-Forwarded-Proto: https' \
+      "http://127.0.0.1:$PORT/api/v1/version" 2>/dev/null) || code=000
+    if [[ $code == 200 ]]; then
+      body=$(<"$STATE/.version")
+      [[ $(jq -r .version <<<"$body") == "${1#v}" ]] && return 0
+      log "127.0.0.1:$PORT serves version $(jq -r .version <<<"$body"), expected ${1#v}"; return 1
+    fi
+    [[ $code == 4?? ]] && { log "forwarded request rejected ($code): check CIPHERDROP_TRUSTED_PROXIES in $DIR/.env"; return 1; }
+    sleep 2
+  done
+  log "no answer on 127.0.0.1:$PORT"; return 1
+}
+
+activate() { # tag
+  log "starting $1"
+  if ! dc "$1" up -d --remove-orphans --wait --wait-timeout "$WAIT_TIMEOUT" >&2; then
+    log "container did not become healthy"
+    dc "$1" ps -a >&2 || true
+    dc "$1" logs --no-color --tail 40 cipherdrop >&2 || true
+    return 1
+  fi
+  local_check "$1"
+}
+
+public_up() { curl -fsS --max-time 10 -o /dev/null "https://$DOMAIN/healthz" 2>/dev/null; }
+
+smoke() { # tag
+  local key=""
+  [[ -s $STATE/smoke-token ]] && key=$(cut -d' ' -f2 "$STATE/smoke-token")
+  SMOKE_API_KEY=$key SMOKE_IMAGE=$(image_of "$1") SMOKE_RETRY_SECONDS=30 \
+    bash "$STATE/releases/$1/stack/bin/smoke-test.sh" "https://$DOMAIN" "$1" >&2
+}
+
+# The post-deploy round trip uses its own token, appended to config.toml once.
+ensure_smoke_token() { # tag
+  local id="" out tok
+  [[ -s $STATE/smoke-token ]] && id=$(cut -d' ' -f1 "$STATE/smoke-token")
+  [[ -n $id ]] && grep -q "^id = \"$id\"" "$DIR/config.toml" && return 0
+  out=$(docker run --rm --network none "$(image_of "$1")" token generate --name cipherdrop-smoke --scope shares:create)
+  tok=$(sed -n 's/^# \(cdt_[A-Za-z0-9_-]*\)$/\1/p' <<<"$out")
+  id=$(sed -n 's/^id = "\([0-9a-f]*\)"$/\1/p' <<<"$out")
+  [[ -n $tok && -n $id ]] || die "could not generate the smoke-test token"
+  { echo; echo "# Added by cipherdropctl for post-deploy smoke tests (create only)."; grep -v '^#' <<<"$out"; } >> "$DIR/config.toml"
+  printf '%s %s\n' "$id" "$tok" > "$STATE/smoke-token"
+  log "added smoke-test token $id to config.toml"
+}
+
+install_tools() { # tag
+  [[ $(env_get CIPHERDROP_AUTO_UPDATE_TOOLS true) == true ]] || return 0
+  local s=$STATE/releases/$1/stack changed=0 f
+  install -d -m 0755 "$LIB"
+  for f in cipherdropctl smoke-test.sh; do
+    cmp -s "$s/bin/$f" "$LIB/$f" && continue
+    install -m 0755 "$s/bin/$f" "$LIB/.$f.new" && mv -f "$LIB/.$f.new" "$LIB/$f"
+  done
+  for f in cipherdrop-update.service cipherdrop-update.timer; do
+    cmp -s "$s/systemd/$f" "/etc/systemd/system/$f" && continue
+    install -m 0644 "$s/systemd/$f" "/etc/systemd/system/$f"; changed=1
+  done
+  (( changed )) && systemctl daemon-reload 2>/dev/null || true
+}
+
+prune() {
+  local cur prev d t
+  cur=$(state_get current); prev=$(state_get previous)
+  for d in "$STATE"/releases/*/; do
+    t=$(basename "$d")
+    [[ $t == "$cur" || $t == "$prev" ]] && continue
+    [[ -s $d/image ]] && docker image rm "$(<"$d/image")" >/dev/null 2>&1 || true
+    rm -rf "$d"
+  done
+  find "$STATE/releases" -mindepth 1 -maxdepth 1 -name '.*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+  docker image prune -f >/dev/null 2>&1 || true
+}
+
+attempt() { # tag -> number of failed preparations so far, incremented
+  local n; n=$(( $(cat "$STATE/attempts/$1" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$STATE/attempts/$1"; echo "$n"
+}
+
+# ------------------------------------------------------------------ deploy ---
+
+do_deploy() { # tag run commit
+  local tag=$1 cur baseline=0 rc=0 n
+  cur=$(state_get current)
+  prepare_release "$1" "$2" "$3" || rc=$?
+  if (( rc )); then
+    n=$(attempt "$tag")
+    if (( rc == 2 || n >= MAX_ATTEMPTS )); then
+      skip_add "$tag"; journal rejected "$tag"
+      notify error "release $tag could not be verified or downloaded; it is skipped. See: journalctl -u cipherdrop-update"
+    fi
+    exit 1
+  fi
+  rm -f "$STATE/attempts/$tag"
+  ensure_smoke_token "$tag"
+  if ! preflight "$tag"; then
+    skip_add "$tag"; journal config-rejected "$tag"
+    notify error "release $tag rejects the current config.toml/.env; still running ${cur:-nothing}. Fix the config, then: sudo cipherdropctl deploy $tag"
+    exit 1
+  fi
+  [[ -n $cur ]] && public_up && baseline=1
+
+  if activate "$tag" && { (( ! baseline )) || smoke "$tag"; }; then
+    [[ -n $cur && $cur != "$tag" ]] && state_set previous "$cur"
+    state_set current "$tag"
+    journal deployed "$tag"
+    install_tools "$tag"
+    prune
+    if (( ! baseline )) && ! public_up; then
+      log "deployed $tag, but https://$DOMAIN/healthz is not reachable yet: configure the reverse proxy ($DIR/proxy/)"
+    fi
+    notify info "deployed $tag${cur:+ (was $cur)}"
+    return 0
+  fi
+
+  skip_add "$tag"; journal failed "$tag"
+  if [[ -n $cur && $cur != "$tag" ]] && activate "$cur"; then
+    journal auto-rollback "$cur"
+    notify error "release $tag failed its checks; rolled back to $cur. $tag is skipped."
+  else
+    journal rollback-failed "${cur:-<none>}"
+    notify error "release $tag failed and ${cur:-no previous release} could not be restored: service may be DOWN"
+  fi
+  exit 1
+}
+
+cmd_update() {
+  local cur cand
+  lock try
+  [[ -f $STATE/paused ]] && exit 0
+  [[ $(env_get CIPHERDROP_AUTO_UPDATE true) == true || ${1:-} == --now ]] || exit 0
+  cur=$(state_get current)
+  cand=$(list_releases "$(env_get CIPHERDROP_CHANNEL stable)" | while read -r t r s; do skipped "$t" || echo "$t $r $s"; done | newest)
+  if [[ -z $cand ]]; then
+    [[ -z $cur ]] && log "no successful release yet: push a vX.Y.Z tag; this host will deploy it automatically"
+    exit 0
+  fi
+  [[ -z $cur ]] || version_gt "${cand%% *}" "$cur" || exit 0
+  # shellcheck disable=SC2086
+  do_deploy $cand
+}
+
+cmd_deploy() {
+  [[ $# -eq 1 && $1 =~ $SEMVER ]] || die "usage: cipherdropctl deploy vX.Y.Z"
+  local line latest
+  lock wait
+  line=$(list_releases any | awk -v t="$1" '$1 == t' | head -n 1)
+  [[ -n $line ]] || die "no successful release run found for $1"
+  skip_remove "$1"; rm -f "$STATE/attempts/$1"
+  # shellcheck disable=SC2086
+  do_deploy $line
+  latest=$(list_releases "$(env_get CIPHERDROP_CHANNEL stable)" | newest)
+  if [[ -n $latest ]] && version_gt "${latest%% *}" "$1"; then
+    touch "$STATE/paused"; journal paused "$1"
+    log "deployed an older release: automatic updates are PAUSED (resume with: cipherdropctl resume)"
+  fi
+}
+
+cmd_rollback() {
+  local cur prev
+  lock wait
+  cur=$(state_get current); prev=$(state_get previous)
+  [[ -n $prev && -s $STATE/releases/$prev/image ]] || die "no previous release on this host"
+  activate "$prev" || { journal rollback-failed "$prev"; notify error "rollback to $prev failed"; exit 1; }
+  state_set current "$prev"; state_set previous "$cur"
+  skip_add "$cur"
+  journal rollback "$prev"
+  notify info "rolled back from $cur to $prev ($cur will not be redeployed automatically; 'cipherdropctl unskip $cur' to allow it)"
+}
+
+cmd_status() {
+  local cur; cur=$(state_get current)
+  echo "domain:      https://$DOMAIN  (upstream http://127.0.0.1:$PORT)"
+  echo "current:     ${cur:-<none>}"
+  echo "previous:    $(state_get previous)"
+  if [[ -f $STATE/paused ]]; then echo "auto-update: PAUSED"; else echo "auto-update: $(env_get CIPHERDROP_AUTO_UPDATE true) (channel $(env_get CIPHERDROP_CHANNEL stable))"; fi
+  [[ -s $STATE/skip ]] && echo "skipped:     $(paste -sd' ' "$STATE/skip")"
+  systemctl list-timers cipherdrop-update.timer --no-pager 2>/dev/null | sed -n '2p' | awk '{print "next check:  " $1, $2, $3}' || true
+  [[ -n $cur ]] || return 0
+  dc "$cur" ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
+  printf 'local:       '; curl -fsS --max-time 5 -H 'X-Forwarded-Proto: https' "http://127.0.0.1:$PORT/api/v1/version" || printf 'unreachable'; echo
+  printf 'public:      '; if public_up; then echo "https://$DOMAIN/healthz OK"; else echo "https://$DOMAIN/healthz UNREACHABLE"; fi
+}
+
+current_or_die() { local c; c=$(state_get current); [[ -n $c ]] || die "nothing deployed yet"; echo "$c"; }
+
+cmd_restart() {
+  local cur; cur=$(current_or_die)
+  lock wait
+  preflight "$cur"
+  ensure_smoke_token "$cur"
+  dc "$cur" up -d --force-recreate --remove-orphans --wait --wait-timeout "$WAIT_TIMEOUT" >&2
+  local_check "$cur"
+  journal restart "$cur"; log "restarted $cur"
+}
+
+cmd_token() {
+  [[ ${1:-} == add && -n ${2:-} ]] || die "usage: cipherdropctl token add NAME [SCOPE...]"
+  local name=$2 cur out args=(); shift 2
+  [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "NAME: letters, digits, . _ - only"
+  cur=$(current_or_die)
+  (( $# )) || set -- shares:create
+  for s in "$@"; do args+=(--scope "$s"); done
+  out=$(docker run --rm --network none "$(image_of "$cur")" token generate --name "$name" "${args[@]}")
+  { echo; echo "# Added by cipherdropctl token add $(date -u +%F)."; grep -v '^#' <<<"$out"; } >> "$DIR/config.toml"
+  preflight "$cur" 2>/dev/null || die "config.toml no longer validates; remove the last block"
+  sed -n 's/^# \(cdt_[A-Za-z0-9_-]*\)$/\1/p' <<<"$out"
+  log "token '$name' ($*) added to config.toml. Shown once above. Apply with: sudo cipherdropctl restart"
+}
+
+cmd_set_token() {
+  local tok full code
+  if [[ -t 0 ]]; then
+    read -rsp "GitHub fine-grained token (Actions: read on $REPO): " tok; echo >&2
+  else
+    IFS= read -r tok || true
+  fi
+  [[ $tok =~ ^[A-Za-z0-9_]{20,255}$ ]] || die "that does not look like a GitHub token"
+  install -d -m 0700 "$ETC"
+  printf '%s\n' "$tok" > "$ETC/.github-token.new"
+  TOKEN_FILE=$ETC/.github-token.new
+  full=$(gh_api "" | jq -r .full_name) || { rm -f "$TOKEN_FILE"; exit 1; }
+  code=$(gh_api "actions/workflows/$WORKFLOW/runs?per_page=1" | jq -r '.total_count') || { rm -f "$TOKEN_FILE"; exit 1; }
+  mv -f "$TOKEN_FILE" "$ETC/github-token"
+  log "token OK for $full ($code release runs visible)"
+}
+
+main() {
+  local cmd=${1:-} c; shift || true
+  case $cmd in
+    update) cmd_update "$@" ;;
+    deploy) cmd_deploy "$@" ;;
+    rollback) cmd_rollback ;;
+    status) cmd_status ;;
+    logs) c=$(current_or_die); dc "$c" logs --no-color --timestamps --tail "${1:-200}" cipherdrop ;;
+    history) tail -n "${1:-50}" "$STATE/history.log" 2>/dev/null || true ;;
+    check-config) c=$(current_or_die); preflight "$c" && log "configuration OK" ;;
+    restart) cmd_restart ;;
+    token) cmd_token "$@" ;;
+    smoke) c=$(current_or_die); smoke "$c" ;;
+    pause) touch "$STATE/paused"; journal paused "-"; log "automatic updates paused" ;;
+    resume) rm -f "$STATE/paused"; journal resumed "-"; log "automatic updates resumed" ;;
+    unskip) [[ -n ${1:-} ]] || usage; skip_remove "$1"; rm -f "$STATE/attempts/$1"; log "$1 may be deployed automatically again" ;;
+    set-token) cmd_set_token ;;
+    down) c=$(current_or_die); lock wait; dc "$c" down --remove-orphans >&2; journal down "$c" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

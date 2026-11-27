@@ -8,6 +8,7 @@
 - Web UI redesigned to be minimal: one centered column, no icons or effects, ~32 KB gzip JS; Argon2 and documentation are loaded on demand.
 - CI actions pinned to commit SHAs with `persist-credentials: false`; base images pinned by digest.
 - See `SECURITY_AUDIT.md`.
+- **Production deployment** (`deploy/production/`, `.github/workflows/release.yml`). One `install.sh` sets up a Debian/Ubuntu host behind an existing reverse proxy. It installs Docker and a pinned cosign, adds a read-only deploy key and an Actions-read token, picks a free Docker subnet and generates nginx, Caddy, Apache and Traefik configurations. A systemd timer runs `cipherdropctl update`, which deploys each successful `v*` release. The tag's commit must match the run, the image archives must match a Sigstore-signed SHA256SUMS bound to the exact tag and commit, and the release must pass config, health, version and public smoke checks. Otherwise it rolls back automatically and skips the release. Also includes notifications, pause/resume, rollback, API token management and an operator runbook. Releases now attach per-architecture image archives to the workflow run.
 
 ## 0.1.0 (unreleased)
 

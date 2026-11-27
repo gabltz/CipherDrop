@@ -1,16 +1,49 @@
 name: Release
+# Tag vX.Y.Z (matching the Cargo workspace version) to release:
+#   full CI -> multi-arch image on GHCR (SBOM, provenance, cosign signature)
+#   -> per-arch image archives + SHA256SUMS signed with Sigstore, uploaded as the
+#      run artifact "cipherdrop-image" -> GitHub release.
+# Production hosts poll for successful runs of this workflow and deploy the
+# artifact themselves (deploy/production, cipherdropctl). Nothing here connects
+# to a server. Pre-release tags (vX.Y.Z-rc.N) are deployed only by hosts on the
+# "prerelease" channel.
 on:
   push: { tags: ["v*"] }
-permissions:
-  contents: write
-  packages: write
-  id-token: write   # keyless cosign signing
+permissions: { contents: read }
+concurrency: { group: "release-${{ github.ref }}", cancel-in-progress: false }
+
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   image:
+    name: Build, sign and push image
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # keyless cosign signing
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false }
+      - name: Check tag matches the workspace version
+        env: { TAG: "${{ github.ref_name }}" }
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $TAG is not of the form vX.Y.Z or vX.Y.Z-pre"; exit 1
+          fi
+          if [[ ${TAG#v} != "$version" ]]; then
+            echo "::error::tag $TAG does not match Cargo.toml workspace version $version"; exit 1
+          fi
+      - name: Image name
+        id: name
+        env: { OWNER: "${{ github.repository_owner }}" }
+        run: echo "repo=ghcr.io/${OWNER,,}/cipherdrop" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -21,8 +54,74 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/cipherdrop:${{ github.ref_name }}
+          tags: ${{ steps.name.outputs.repo }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
           provenance: true
           sbom: true
-      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-      - run: cosign sign --yes ghcr.io/${{ github.repository_owner }}/cipherdrop@${{ steps.build.outputs.digest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+        with: { cosign-release: v3.1.6 }   # same version as deploy/production/install.sh
+      - name: Sign image (keyless)
+        env:
+          REPO: ${{ steps.name.outputs.repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$REPO@$DIGEST"
+      - id: ref
+        env:
+          REPO: ${{ steps.name.outputs.repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "image=$REPO@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Image: \`$REPO@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Export image archives for production hosts
+        env:
+          REPO: ${{ steps.name.outputs.repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          command -v skopeo > /dev/null || { sudo apt-get update -q && sudo apt-get install -y -q skopeo; }
+          mkdir dist
+          for arch in amd64 arm64; do
+            out="dist/cipherdrop-$TAG-linux-$arch.tar"
+            # Exactly the pushed (and signed) manifest for this platform, as a `docker load` archive.
+            skopeo copy --quiet --override-os linux --override-arch "$arch" \
+              "docker://$REPO@$DIGEST" "docker-archive:$out:$REPO:$TAG"
+            config=$(tar -xOf "$out" manifest.json | jq -r '.[0].Config')
+            test "$(tar -xOf "$out" "$config" | jq -r .architecture)" = "$arch"
+          done
+          jq -n --arg v "$TAG" --arg c "$GITHUB_SHA" --arg i "$REPO@$DIGEST" \
+            '{version: $v, commit: $c, image: $i}' > dist/release.json
+          (cd dist && sha256sum -- release.json cipherdrop-*.tar > SHA256SUMS && cat SHA256SUMS)
+      - name: Sign SHA256SUMS (keyless; hosts verify workflow, tag and commit)
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cipherdrop-image
+          path: dist/
+          retention-days: 90
+          compression-level: 0   # layers are already compressed
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: image
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists"; exit 0
+          fi
+          pre=(); [[ $TAG == *-* ]] && pre=(--prerelease)
+          # shellcheck disable=SC2016  # literal Markdown backticks
+          printf 'Container image (signed with cosign, keyless):\n\n```\n%s\n```\n' "$IMAGE" > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+            --notes-file notes.md --generate-notes "${pre[@]}"

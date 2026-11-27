@@ -1,0 +1,16 @@
+# Overlay for a reverse proxy that itself runs in Docker (Traefik, Nginx Proxy
+# Manager, Caddy, ...): attaches CipherDrop to the proxy's network so it can
+# reach http://cipherdrop:8080. Enabled by CIPHERDROP_PROXY_NETWORK in .env
+# (install.sh --proxy-network NAME), which also adds that network's subnet to
+# CIPHERDROP_TRUSTED_PROXIES. The loopback port stays published for health checks.
+services:
+  cipherdrop:
+    networks:
+      internal: {}
+      proxy:
+        aliases: [cipherdrop]
+
+networks:
+  proxy:
+    external: true
+    name: ${CIPHERDROP_PROXY_NETWORK:?set CIPHERDROP_PROXY_NETWORK in .env}
