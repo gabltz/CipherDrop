@@ -64,11 +64,11 @@ internet. Docker is installed if missing. Existing containers and Docker setting
 alone. For `caddy` mode, the domain's DNS must point at the host and ports 80/443 must be free
 and reachable.
 
-1. Copy the script to the host and run it. Without `--mode` it asks:
+1. Download the script on the host and run it. Without `--mode` it asks:
 
    ```bash
-   scp deploy/production/install.sh root@HOST:
-   ssh -t root@HOST bash install.sh --domain paste.example.com
+   curl -fsSLO https://raw.githubusercontent.com/gabltz/CipherDrop/main/deploy/production/install.sh
+   sudo bash install.sh --domain paste.example.com
 
    # or say it up front:
    bash install.sh --domain paste.example.com --mode local  --port 8080

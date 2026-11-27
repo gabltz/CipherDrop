@@ -3,7 +3,14 @@
 `cipherdrop` is a statically linkable Rust client. It encrypts and decrypts locally and is the most trustworthy way to use CipherDrop, because its code does not come from the server at runtime.
 
 ```bash
-cargo install --path crates/cli        # installs the `cipherdrop` binary
+cargo install --locked --git https://github.com/gabltz/CipherDrop cipherdrop-cli   # installs `cipherdrop`
+cargo install --locked --path crates/cli                                          # from a checkout
+```
+
+Without Rust, use the copy in the release image:
+
+```bash
+alias cipherdrop='docker run --rm -i --entrypoint cipherdrop ghcr.io/gabltz/cipherdrop:latest'
 ```
 
 ## Design rules

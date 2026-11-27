@@ -23,6 +23,8 @@ Its `README.md` is the operator runbook.
 
 The image is built from `Dockerfile` (multi-stage: Node builds the frontend, Rust builds a static musl binary, and the runtime image is `scratch`-based with only the binary and CA certificates). It runs as UID 65532, exposes port 8080, and has a `HEALTHCHECK` using the binary itself.
 
+Release images are published as `ghcr.io/gabltz/cipherdrop:vX.Y.Z` (and `:latest` for the newest stable release), for amd64 and arm64, with an SBOM, provenance and a Sigstore signature. To build your own:
+
 ```bash
 docker build -t cipherdrop:latest .
 docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/cipherdrop:0.1.0 --push .
@@ -35,7 +37,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/c
 ```yaml
 services:
   cipherdrop:
-    image: cipherdrop:latest
+    image: ghcr.io/gabltz/cipherdrop:latest
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

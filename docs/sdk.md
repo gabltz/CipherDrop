@@ -20,7 +20,7 @@ Every client encrypts locally and is interoperable with the web interface: a sha
 
 ```toml
 [dependencies]
-cipherdrop-sdk = { git = "<repository URL>" }
+cipherdrop-sdk = { git = "https://github.com/gabltz/CipherDrop", tag = "v0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 secrecy = "0.10"
 ```
@@ -52,8 +52,12 @@ The SDK uses rustls with the operating system's trust store. Certificate validat
 
 One package serves both languages: it is written in TypeScript and published as ES modules with type declarations, so plain JavaScript consumers use exactly the same tested code. Works in modern browsers and Node.js ≥ 20.19 (Web Crypto plus a bundled Argon2id WebAssembly module, with no network fetches).
 
+The package isn't on npm yet. Build it from a checkout:
+
 ```bash
-npm run build -w @cipherdrop/sdk && npm install ./sdk/typescript   # from this repository
+git clone --depth 1 --branch v0.1.0 https://github.com/gabltz/CipherDrop && cd CipherDrop
+npm ci && npm run build -w @cipherdrop/sdk
+npm pack -w @cipherdrop/sdk          # -> cipherdrop-sdk-0.1.0.tgz; in your project: npm install /path/to/cipherdrop-sdk-0.1.0.tgz
 ```
 
 Plain JavaScript (ESM):
@@ -90,7 +94,7 @@ Options: `ttl` (seconds, `null` = never), `maxReads` (`null` = unlimited), `pass
 The `cipherdrop` package (`sdk/python`) depends only on the well-established [`cryptography`](https://cryptography.io) package (AES-GCM, HKDF and Argon2id) plus the standard library. TLS certificates are always verified.
 
 ```bash
-pip install ./sdk/python
+pip install "git+https://github.com/gabltz/CipherDrop@v0.1.0#subdirectory=sdk/python"   # or: pip install ./sdk/python
 export CIPHERDROP_SERVER=https://paste.example.com
 printf 'example secret' | python -m cipherdrop create --ttl 3600 --max-reads 1
 python -m cipherdrop read < link.txt
