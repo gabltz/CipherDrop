@@ -1,0 +1,16 @@
+[Unit]
+Description=CipherDrop: allow the backend port only from the reverse proxy (remote mode)
+Documentation=file:///var/lib/cipherdrop/src/deploy/production/README.md
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No-op unless CIPHERDROP_MODE=remote and CIPHERDROP_FIREWALL=true.
+ExecStart=/usr/local/bin/cipherdropctl firewall apply
+ExecStop=/usr/local/bin/cipherdropctl firewall remove
+
+[Install]
+WantedBy=multi-user.target docker.service

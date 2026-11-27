@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # CipherDrop production installer — the only script to run on the host.
 #
-#   sudo bash install.sh --domain paste.example.com
+#   sudo bash install.sh --domain paste.example.com                      # asks how it is reached
+#   sudo bash install.sh --domain paste.example.com --mode local          # proxy on this host
+#   sudo bash install.sh --domain paste.example.com --mode remote --proxy-ip 10.0.0.5 --port 8080
+#   sudo bash install.sh --domain paste.example.com --mode caddy --email ops@example.com
 #
-# Works on Debian 12+/Ubuntu 22.04+ (amd64/arm64) with a reverse proxy on the
-# same host that terminates TLS. It is safe to re-run: keys, token, .env and
-# config.toml are kept (options you pass update the matching settings).
+# Debian 12+/Ubuntu 22.04+ (amd64/arm64). Three ways to reach CipherDrop:
+#   local   a reverse proxy on THIS host terminates TLS -> http://127.0.0.1:PORT
+#   remote  a reverse proxy on ANOTHER server (e.g. nginx proxy_pass) -> http://THIS-HOST-IP:PORT,
+#           firewalled so that only the proxy's IP can connect
+#   caddy   no reverse proxy: the bundled Caddy serves HTTPS on 80/443 with
+#           automatic certificates
+# It is safe to re-run: keys, token, .env and config.toml are kept (options you
+# pass update the matching settings; the service is restarted if they changed).
 #
 # What it does:
 #   1. installs git, curl, jq, unzip, Docker Engine + Compose (if missing) and
@@ -15,16 +23,22 @@
 #      repository (stored root-only in /etc/cipherdrop, used to download releases)
 #   4. writes /opt/cipherdrop/.env and config.toml, picks a free Docker subnet
 #   5. installs cipherdropctl and the cipherdrop-update timer (checks every 5 min)
-#   6. deploys the newest verified release, and prints the reverse proxy
-#      configuration to use (/opt/cipherdrop/proxy/)
+#   6. deploys the newest verified release, and (local/remote) writes the
+#      reverse proxy configuration to use (/opt/cipherdrop/proxy/)
 #
 # Nothing in GitHub can reach this host: it pulls signed releases itself.
 #
 # Options:
-#   --domain NAME          public hostname served by the reverse proxy (asked if missing)
+#   --domain NAME          public hostname (asked if missing)
+#   --mode local|remote|caddy     how CipherDrop is reached (asked on first run)
+#   --port N               port the reverse proxy forwards to (proxy_pass), default 8080
+#   --proxy-ip IP[,IP...]  remote: address(es) of the reverse proxy server (IPv4 or CIDR)
+#   --bind ADDRESS         remote: local address to listen on (default: the address
+#                          this host uses to reach the proxy; 0.0.0.0 = all)
+#   --no-firewall          remote: do not restrict the port to --proxy-ip
+#   --email ADDRESS        caddy: ACME account e-mail ("internal" = Caddy's own CA)
+#   --proxy-network NAME   local: the reverse proxy runs in Docker on network NAME ("" to unset)
 #   --repo OWNER/NAME      GitHub repository (default: gabltz/CipherDrop)
-#   --port N               loopback port for the reverse proxy (default 8080)
-#   --proxy-network NAME   the reverse proxy runs in Docker on network NAME ("" to unset)
 #   --notify-url URL       ntfy/Slack/Discord/webhook URL for deploy notifications ("" to unset)
 #   --channel stable|prerelease   deploy pre-release tags too (default stable)
 #   --persistent true|false       SQLite-backed persistent shares (default false)
@@ -60,6 +74,7 @@ export CIPHERDROP_ETC=$ETC CIPHERDROP_DIR=$DIR CIPHERDROP_STATE_DIR=$STATE CIPHE
 UNSET=__unset__
 
 domain="" repo="" port="" proxy_network=$UNSET notify=$UNSET channel="" persistent=""
+mode="" proxy_ips="" bind="" email="" firewall=""
 token_file="" reset_token=0 harden=0 deploy=1 interactive=1 uninstall=0
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -72,6 +87,11 @@ while [[ $# -gt 0 ]]; do
     --domain) domain=${2:?}; shift 2 ;;
     --repo) repo=${2:?}; shift 2 ;;
     --port) port=${2:?}; shift 2 ;;
+    --mode) mode=${2:?}; shift 2 ;;
+    --proxy-ip | --proxy-ips) proxy_ips=${2:?}; shift 2 ;;
+    --bind) bind=${2:?}; shift 2 ;;
+    --no-firewall) firewall=false; shift ;;
+    --email) email=${2:?}; shift 2 ;;
     --proxy-network) proxy_network=${2?}; shift 2 ;;
     --notify-url) notify=${2?}; shift 2 ;;
     --channel) channel=${2:?}; shift 2 ;;
@@ -82,7 +102,7 @@ while [[ $# -gt 0 ]]; do
     --no-deploy) deploy=0; shift ;;
     --non-interactive) interactive=0; shift ;;
     --uninstall) uninstall=1; shift ;;
-    -h | --help) sed -n '2,42s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,52s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
@@ -114,8 +134,11 @@ if (( uninstall )); then
   say "Uninstalling CipherDrop"
   systemctl disable --now cipherdrop-update.timer 2>/dev/null || true
   [[ -x /usr/local/bin/cipherdropctl && -f $DIR/.env ]] && /usr/local/bin/cipherdropctl down 2>/dev/null || true
+  [[ -x /usr/local/bin/cipherdropctl && -f $DIR/.env ]] && /usr/local/bin/cipherdropctl firewall remove 2>/dev/null || true
+  systemctl disable cipherdrop-firewall.service 2>/dev/null || true
   docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '/cipherdrop:v' | xargs -r docker image rm >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/cipherdrop-update.service /etc/systemd/system/cipherdrop-update.timer /usr/local/bin/cipherdropctl
+  rm -f /etc/systemd/system/cipherdrop-update.service /etc/systemd/system/cipherdrop-update.timer \
+    /etc/systemd/system/cipherdrop-firewall.service /usr/local/bin/cipherdropctl
   systemctl daemon-reload 2>/dev/null || true
   rm -rf "$LIB" "$STATE" "$ETC"
   if [[ -d $DIR ]]; then
@@ -134,23 +157,95 @@ fi
 arch=$(dpkg --print-architecture)
 [[ -n ${COSIGN_SHA256[$arch]:-} ]] || die "unsupported architecture $arch (amd64 and arm64 are supported)"
 
+# ss/ip are needed for the port and address checks below.
+if ! command -v ss >/dev/null || ! command -v ip >/dev/null; then apt-get update -q >/dev/null; apt-get install -y -q iproute2 >/dev/null; fi
+
 first_run=0; [[ -f $DIR/.env ]] || first_run=1
 [[ -n $repo ]] || repo=$(env_get CIPHERDROP_GITHUB_REPO)
 [[ -n $repo && $repo != OWNER/* ]] || repo=$DEFAULT_REPO
 [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid --repo $repo"
 [[ -n $domain ]] || domain=$(env_get CIPHERDROP_DOMAIN)
-[[ -n $domain && $domain != paste.example.com ]] || domain=$(ask "Public hostname (served by your reverse proxy)" "")
+[[ -n $domain && $domain != paste.example.com ]] || domain=$(ask "Public hostname (e.g. paste.example.com)" "")
 domain=${domain,,}
 [[ $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || die "invalid domain '$domain'"
-[[ -n $port ]] || port=$(env_get CIPHERDROP_PORT); port=${port:-8080}
+
+is_ipv4() { [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] && (( BASH_REMATCH[1] < 256 && BASH_REMATCH[2] < 256 && BASH_REMATCH[3] < 256 && BASH_REMATCH[4] < 256 )); }
+is_cidr() { local ip=${1%/*} len=${1#*/}; is_ipv4 "$ip" && { [[ $1 != */* ]] || { [[ $len =~ ^[0-9]+$ ]] && (( len <= 32 )); }; }; }
+is_private() { [[ $1 =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|127\.) ]]; }
+listening() { # port [address] -> 0 if something other than CipherDrop listens there
+  local p=$1 a=${2:-0.0.0.0} l ours
+  ours=$(docker ps -q --filter label=com.docker.compose.project=cipherdrop 2>/dev/null | xargs -r -n1 docker port 2>/dev/null | awk '{print $NF}')
+  while read -r l; do
+    [[ $l == *":$p" ]] || continue
+    grep -qxF "$l" <<<"$ours" && continue
+    grep -qE ":$p\$" <<<"$ours" && [[ $l == "0.0.0.0:$p" || $l == "[::]:$p" || $l == "*:$p" ]] && continue
+    case $l in "$a:$p" | "0.0.0.0:$p" | "*:$p" | "[::]:$p") return 0 ;; esac
+    [[ $a == 0.0.0.0 ]] && return 0
+  done < <(ss -Hltn 2>/dev/null | awk '{print $4}')
+  return 1
+}
+
+[[ -n $mode ]] || mode=$(env_get CIPHERDROP_MODE)
+if [[ -z $mode ]]; then
+  suggest=1; listening 443 && suggest=1 || suggest=3
+  if (( interactive )); then
+    cat <<EOF
+
+    How will https://$domain reach CipherDrop?
+      1) a reverse proxy on THIS server (nginx, Caddy, Apache, Traefik...)
+      2) a reverse proxy on ANOTHER server (e.g. nginx proxy_pass to this host)
+      3) no reverse proxy: use the bundled Caddy on ports 80/443 (automatic HTTPS)
+EOF
+    c=$(ask "Choice" "$suggest")
+  else
+    c=1
+  fi
+  case $c in 1 | local) mode=local ;; 2 | remote) mode=remote ;; 3 | caddy) mode=caddy ;; *) die "invalid choice '$c'" ;; esac
+fi
+[[ $mode == local || $mode == remote || $mode == caddy ]] || die "--mode must be local, remote or caddy"
+
+[[ -n $port ]] || port=$(env_get CIPHERDROP_PORT)
+if [[ -z $port ]]; then
+  if [[ $mode == caddy ]]; then port=8080; else port=$(ask "Port the reverse proxy forwards to (proxy_pass)" 8080); fi
+fi
 { [[ $port =~ ^[0-9]+$ ]] && (( port > 0 && port < 65536 )); } || die "invalid --port"
+
+case $mode in
+  local) bind=127.0.0.1 ;;
+  caddy)
+    bind=127.0.0.1
+    [[ -n $email ]] || email=$(env_get CIPHERDROP_CADDY_TLS)
+    [[ -n $email ]] || email=$(ask "E-mail for Let's Encrypt (certificate notices), or 'internal'" "")
+    [[ $email == internal || $email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "invalid --email '$email'"
+    for p in 80 443; do listening "$p" && die "port $p is already in use on this host: use --mode local with your existing web server"; done
+    ;;
+  remote)
+    [[ -n $proxy_ips ]] || proxy_ips=$(env_get CIPHERDROP_PROXY_IPS)
+    [[ -n $proxy_ips ]] || proxy_ips=$(ask "IP address(es) of the reverse proxy server (comma-separated)" "")
+    proxy_ips=${proxy_ips// /}
+    IFS=, read -r -a _ips <<<"$proxy_ips"
+    (( ${#_ips[@]} )) || die "--proxy-ip is required in remote mode"
+    for i in "${_ips[@]}"; do is_cidr "$i" || die "invalid --proxy-ip '$i' (IPv4 address or CIDR)"; done
+    [[ -n $bind ]] || bind=$(env_get CIPHERDROP_BIND_ADDRESS)
+    [[ -n $bind && $bind != 127.0.0.1 ]] || bind=$(ip -4 route get "${_ips[0]%/*}" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+    [[ -n $bind ]] || die "could not determine the address to listen on; pass --bind ADDRESS"
+    is_ipv4 "$bind" || die "invalid --bind '$bind'"
+    [[ $bind == 0.0.0.0 ]] || ip -4 -o addr show | grep -q " $bind/" || die "--bind $bind is not an address of this host"
+    ;;
+esac
+listening "$port" "$bind" && die "port $port is already in use on this host: choose another with --port"
+listening "$port" 127.0.0.1 && [[ $bind != 0.0.0.0 ]] && die "port $port is already in use on 127.0.0.1: choose another with --port"
 [[ -z $channel || $channel == stable || $channel == prerelease ]] || die "--channel must be stable or prerelease"
 [[ -z $persistent || $persistent == true || $persistent == false ]] || die "--persistent must be true or false"
 
 cat <<EOF
 
   CipherDrop installer
-    domain      https://$domain  (reverse proxy -> http://127.0.0.1:$port)
+    domain      https://$domain
+    mode        $mode$(case $mode in
+      local) echo " (reverse proxy on this host -> http://127.0.0.1:$port)" ;;
+      remote) echo " (reverse proxy $proxy_ips -> http://$bind:$port)" ;;
+      caddy) echo " (bundled Caddy on ports 80/443)" ;; esac)
     repository  $repo
 EOF
 
@@ -245,7 +340,8 @@ P=$src/deploy/production
 install -m 0755 "$P/bin/cipherdropctl" "$LIB/cipherdropctl"
 install -m 0755 "$P/bin/smoke-test.sh" "$LIB/smoke-test.sh"
 ln -sfn "$LIB/cipherdropctl" /usr/local/bin/cipherdropctl
-install -m 0644 "$P/systemd/cipherdrop-update.service" "$P/systemd/cipherdrop-update.timer" /etc/systemd/system/
+install -m 0644 "$P/systemd/cipherdrop-update.service" "$P/systemd/cipherdrop-update.timer" \
+  "$P/systemd/cipherdrop-firewall.service" /etc/systemd/system/
 systemctl daemon-reload
 info "installed cipherdropctl ($(git -C "$src" rev-parse --short HEAD))"
 
@@ -265,6 +361,7 @@ used_subnets() {
   ip -4 route show 2>/dev/null | awk '$1 ~ /\// { print $1 }'
 }
 
+before=$({ cat "$DIR/.env" "$DIR/config.toml" 2>/dev/null || true; } | sha256sum)
 if (( first_run )); then
   install -m 0600 "$P/env.example" "$DIR/.env"
   used=$(used_subnets | grep -E '^[0-9.]+/[0-9]+$' || true)
@@ -281,6 +378,11 @@ if (( first_run )); then
 fi
 set_env CIPHERDROP_DOMAIN "$domain"
 set_env CIPHERDROP_PORT "$port"
+set_env CIPHERDROP_MODE "$mode"
+set_env CIPHERDROP_BIND_ADDRESS "$bind"
+[[ $mode == remote ]] && set_env CIPHERDROP_PROXY_IPS "$proxy_ips"
+[[ $mode == caddy ]] && set_env CIPHERDROP_CADDY_TLS "$email"
+[[ -n $firewall ]] && set_env CIPHERDROP_FIREWALL "$firewall"
 set_env CIPHERDROP_GITHUB_REPO "$repo"
 [[ -n ${CIPHERDROP_GIT_URL:-} ]] && set_env CIPHERDROP_GIT_URL "$CIPHERDROP_GIT_URL"
 [[ -n $channel ]] && set_env CIPHERDROP_CHANNEL "$channel"
@@ -288,11 +390,19 @@ set_env CIPHERDROP_GITHUB_REPO "$repo"
 [[ $notify != "$UNSET" ]] && set_env CIPHERDROP_NOTIFY_URL "$notify"
 [[ $proxy_network != "$UNSET" ]] && set_env CIPHERDROP_PROXY_NETWORK "$proxy_network"
 
-# Peers allowed to set X-Forwarded-*: the Docker gateway (loopback port forward)
-# plus, for a containerised proxy, its network.
+# Peers allowed to set X-Forwarded-*: the Docker gateway (loopback port, used
+# by the local proxy and health checks), plus the remote proxy's addresses, the
+# internal network (bundled Caddy) or a containerised proxy's network.
 gw=$(env_get CIPHERDROP_GATEWAY)
 trusted="\"$gw/32\""
 pnet=$(env_get CIPHERDROP_PROXY_NETWORK)
+[[ $mode == local ]] || pnet=""
+if [[ $mode == remote ]]; then
+  for i in "${_ips[@]}"; do [[ $i == */* ]] || i=$i/32; trusted+=",\"$i\""; done
+  is_private "$bind" || warn "$bind is a public address: traffic between the proxy and this host is plain HTTP (API tokens included). Prefer a private network or VPN between them."
+elif [[ $mode == caddy ]]; then
+  trusted="\"$(env_get CIPHERDROP_SUBNET)\""
+fi
 if [[ -n $pnet ]]; then
   docker network inspect "$pnet" >/dev/null 2>&1 || die "Docker network '$pnet' (--proxy-network) does not exist"
   for s in $(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$pnet"); do
@@ -332,26 +442,47 @@ else
 fi
 
 # -------------------------------------------------------------- reverse proxy -
+if [[ $mode == caddy ]]; then
+  say "HTTPS: bundled Caddy"
+  rm -rf "$DIR/proxy"
+  info "Caddy obtains a certificate for $domain on first start: its DNS A/AAAA record must point"
+  info "at this host and ports 80 and 443 must be reachable from the internet."
+else
 say "Reverse proxy configuration ($DIR/proxy/)"
 install -d -m 0755 "$DIR/proxy"
-if [[ -n $pnet ]]; then upstream=cipherdrop:8080; else upstream=127.0.0.1:$port; fi
+if [[ -n $pnet ]]; then upstream=cipherdrop:8080
+elif [[ $mode == remote ]]; then upstream=$([[ $bind == 0.0.0.0 ]] && ip -4 route get "${_ips[0]%/*}" | sed -n 's/.* src \([0-9.]*\).*/\1/p' || echo "$bind"):$port
+else upstream=127.0.0.1:$port; fi
 for f in nginx.conf Caddyfile apache.conf traefik.yml; do
   sed -e "s|__DOMAIN__|$domain|g" -e "s|__UPSTREAM__|$upstream|g" -e "s|__FILE__|$DIR/proxy/$f|g" "$P/proxy/$f" > "$DIR/proxy/$f"
+  [[ $mode == remote ]] && sed -i "1a # REMOTE MODE: copy this file to the reverse proxy server ($proxy_ips); it forwards to http://$upstream" "$DIR/proxy/$f"
   chmod 0644 "$DIR/proxy/$f"
 done
+fi
+if [[ $mode == remote ]]; then
+  info "On the proxy server, forward https://$domain to http://$upstream"
+  info "(nginx: proxy_pass http://$upstream; ready-made file: $DIR/proxy/nginx.conf)"
+  if [[ $(env_get CIPHERDROP_FIREWALL) == false ]]; then
+    warn "firewall disabled: anyone who can reach $bind:$port can connect (non-proxied requests are still refused)"
+  else
+    info "firewall: only $proxy_ips may connect to $bind:$port"
+  fi
+fi
 found=()
 for b in nginx caddy apache2 httpd traefik haproxy; do
   if systemctl is-active --quiet "$b" 2>/dev/null || pgrep -x "$b" >/dev/null 2>&1; then found+=("$b (host)"); fi
 done
 while read -r img name; do
   [[ -n $img ]] && found+=("$name (container $img)")
-done < <(docker ps --format '{{.Image}} {{.Names}}' | grep -Ei 'traefik|nginx|caddy|proxy-manager|haproxy|swag' || true)
-if (( ${#found[@]} )); then info "detected: ${found[*]}"; else warn "no reverse proxy detected on this host"; fi
-if [[ -z $pnet && ${found[*]} == *container* ]]; then
-  warn "a containerised proxy cannot reach 127.0.0.1:$port on the host. Re-run with"
-  warn "--proxy-network <its Docker network> (docker network ls) so it can use http://cipherdrop:8080."
+done < <(docker ps --format '{{.Image}} {{.Names}}' | grep -v 'cipherdrop-' | grep -Ei 'traefik|nginx|caddy|proxy-manager|haproxy|swag' || true)
+if [[ $mode == local ]]; then
+  if (( ${#found[@]} )); then info "detected: ${found[*]}"; else warn "no reverse proxy detected on this host (use --mode caddy if there is none)"; fi
+  if [[ -z $pnet && ${found[*]} == *container* ]]; then
+    warn "a containerised proxy cannot reach 127.0.0.1:$port on the host. Re-run with"
+    warn "--proxy-network <its Docker network> (docker network ls) so it can use http://cipherdrop:8080."
+  fi
+  info "upstream: http://$upstream   (send X-Forwarded-Proto: https; stream bodies; no access log)"
 fi
-info "upstream: http://$upstream   (send X-Forwarded-Proto: https; stream bodies; no access log)"
 
 # ------------------------------------------------------------ host hardening --
 if (( harden )); then
@@ -371,7 +502,13 @@ if (( harden )); then
 fi
 
 # ------------------------------------------------------------------- deploy --
+after=$(cat "$DIR/.env" "$DIR/config.toml" | sha256sum)
+systemctl enable cipherdrop-firewall.service >/dev/null 2>&1 || true
 if (( deploy )); then
+  if [[ -s $STATE/current && $before != "$after" ]]; then
+    say "Applying the changed settings"
+    cipherdropctl restart || warn "restart failed (see above); fix the settings and run: sudo cipherdropctl restart"
+  fi
   say "Deploying the newest release"
   cipherdropctl update --now || warn "deploy did not complete (see above); the timer retries every 5 minutes"
 fi
@@ -383,8 +520,13 @@ cipherdropctl status || true
 cat <<EOF
 
   Done. Next:
-    - configure your reverse proxy with the matching file in $DIR/proxy/
-      (upstream http://$upstream, TLS certificate for $domain)
+$(case $mode in
+  local) echo "    - configure your reverse proxy with the matching file in $DIR/proxy/"
+         echo "      (upstream http://$upstream, TLS certificate for $domain)" ;;
+  remote) echo "    - on the proxy server ($proxy_ips): forward https://$domain to http://$upstream"
+          echo "      (ready-made nginx/Caddy/Apache/Traefik files in $DIR/proxy/)" ;;
+  caddy) echo "    - point the DNS record of $domain at this host; Caddy handles HTTPS" ;;
+esac)
     - API tokens for senders:   sudo cipherdropctl token add alice && sudo cipherdropctl restart
     - releases: push a tag vX.Y.Z; this host deploys it within ~5 minutes
     - runbook:  $src/deploy/production/README.md   (cipherdropctl --help)

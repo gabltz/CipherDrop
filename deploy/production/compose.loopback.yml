@@ -1,0 +1,7 @@
+# Overlay for CIPHERDROP_MODE=remote with a specific bind address: also
+# publishes the port on loopback for cipherdropctl's local health checks.
+# (Not used when CIPHERDROP_BIND_ADDRESS is 0.0.0.0, which includes loopback.)
+services:
+  cipherdrop:
+    ports:
+      - "127.0.0.1:${CIPHERDROP_PORT:-8080}:8080"

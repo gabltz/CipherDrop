@@ -1,4 +1,7 @@
-# CipherDrop production stack, behind a reverse proxy on the same host.
+# CipherDrop production stack. CIPHERDROP_MODE in .env selects the front end:
+#   local   reverse proxy on this host       -> 127.0.0.1:PORT
+#   remote  reverse proxy on another server  -> BIND_ADDRESS:PORT (+ compose.loopback.yml)
+#   caddy   no external proxy                -> bundled Caddy on 80/443 (compose.caddy.yml)
 #
 # Driven by cipherdropctl (do not run `docker compose` by hand): it supplies
 # CIPHERDROP_IMAGE (a verified, locally loaded release image) and
@@ -31,8 +34,8 @@ services:
       # TLS is terminated by the reverse proxy, which must send X-Forwarded-Proto: https.
       CIPHERDROP__SECURITY__REQUIRE_HTTPS: "true"
       CIPHERDROP__SECURITY__TRUST_FORWARDED_HEADERS: "true"
-      # The proxy reaches the container through the loopback port below; Docker
-      # forwards it from this network's gateway. install.sh computes the list.
+      # Who may set X-Forwarded-*: the Docker gateway (loopback port), the remote
+      # proxy's IPs, or the internal network (bundled Caddy). install.sh computes it.
       CIPHERDROP__SECURITY__TRUSTED_PROXIES: "${CIPHERDROP_TRUSTED_PROXIES:?set by install.sh}"
       CIPHERDROP__STORAGE__MAX_MEMORY_MB: "${CIPHERDROP_MAX_MEMORY_MB:-128}"
       CIPHERDROP__LOGGING__LEVEL: "warn"
@@ -41,8 +44,9 @@ services:
       - ${CIPHERDROP_CONFIG_FILE:?set by cipherdropctl}:/etc/cipherdrop/config.toml:ro
     command: ["serve", "--config", "/etc/cipherdrop/config.toml"]
     ports:
-      # Loopback only: reachable by the reverse proxy on this host, not from outside.
-      - "127.0.0.1:${CIPHERDROP_PORT:-8080}:8080"
+      # local/caddy: loopback only. remote: the address the other server's proxy
+      # connects to (firewalled to the proxy's IPs by cipherdropctl).
+      - "${CIPHERDROP_BIND_ADDRESS:-127.0.0.1}:${CIPHERDROP_PORT:-8080}:8080"
     networks: [internal]
     logging:
       driver: local

@@ -1,0 +1,21 @@
+# Bundled Caddy for CIPHERDROP_MODE=caddy (see compose.caddy.yml).
+{
+	admin off
+}
+
+{$CIPHERDROP_DOMAIN} {
+	tls {$CIPHERDROP_CADDY_TLS}
+	encode zstd gzip
+	header -Server
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy cipherdrop:8080 {
+		# Stream bodies; never spool to disk.
+		flush_interval -1
+	}
+	# URLs contain share ids: no access log.
+	log {
+		output discard
+	}
+}
